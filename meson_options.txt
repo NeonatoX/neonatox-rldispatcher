@@ -1,0 +1,6 @@
+option('glibc_sysroot', type: 'string', value: '/usr/lib/glibc6',
+    description: 'Raiz del arbol glibc aislado (default de build; nrld NO lo hace configurable en runtime por diseno)')
+option('neonatox_dir', type: 'string', value: '/usr/lib/neonatox',
+    description: 'Directorio HOST donde se instalan nrld y libnrld-proxy.so (no va al sysroot)')
+option('interp_path', type: 'string', value: '/lib64/ld-linux-x86-64.so.2',
+    description: 'Ruta del symlink de interp del kernel que apunta a nrld')

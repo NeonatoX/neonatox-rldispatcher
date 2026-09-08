@@ -94,6 +94,16 @@ static int file_exists(const char *path) {
 static char g_patched_bin[4096];
 static char g_interp_bin[4096];
 
+/* Configurable install defaults. Overridable at build time (Meson passes
+   -DNEO_SYSROOT/-DNEO_BINDIR); /usr/lib/glibc6 remains the default sysroot.
+   Kept before resolve_lib_path/appimages.c so everything can derive from them. */
+#ifndef NEO_SYSROOT
+#define NEO_SYSROOT   "/usr/lib/glibc6"
+#endif
+#ifndef NEO_BINDIR
+#define NEO_BINDIR    "/usr/lib/neonatox"
+#endif
+
 static int is_elf(const char *path) {
     char header[4];
     long fd = syscall2(SYS_open, (long)path, 0);
@@ -237,6 +247,7 @@ static long read_at(long fd, unsigned long off, char *buf, unsigned long want) {
 static char g_appimage_root[4096];
 static char g_appimage_bin[4096];
 static int  g_appimage_extracted = 0;
+static int  g_appimage_script = 0;   /* AppRun es un script #!, se exec directo */
 static char g_extra_libdirs[MAX_EXTRA_DIRS][4096];
 static int  g_extra_libdirs_n = 0;
 static char g_qt_plugin_path[4096];
@@ -267,7 +278,7 @@ static int resolve_lib_path(const char *soname, const char *lib_root, char *out)
         my_strcpy(out, g_extra_libdirs[i]); my_strcat(out, "/"); my_strcat(out, soname);
         if (file_exists(out)) return 1;
     }
-    const char *dirs[] = { "/usr/lib/glibc6/usr/lib", "/usr/lib/glibc6/lib" };
+    const char *dirs[] = { NEO_SYSROOT "/usr/lib", NEO_SYSROOT "/lib" };
     for (int i = 0; i < 2; i++) {
         my_strcpy(out, dirs[i]); my_strcat(out, "/"); my_strcat(out, soname);
         if (file_exists(out)) return 1;
@@ -614,30 +625,72 @@ static int check_needed_libs(const char *path, const char *bin_dir) {
 }
 
 
-/* Config file for `nrld` default behaviour. If it exists and contains the
-   token "strict", strict sysroot mode is enabled so plain `./firefox`
-   behaves as NEONATOX_STRICT_SYSROOT=1. Path: /usr/lib/glibc6/etc/nrld.conf */
-#define NRLCONF_PATH "/usr/lib/glibc6/etc/nrld.conf"
+/* Config file for nrld default behaviour, installed on the HOST at /etc
+   (NOT inside the sysroot, so it can point at any sysroot/proxy path). It is
+   written by the installer. Format: one "key = value" per line; the bare
+   token "strict" enables strict mode for all apps (same as setting
+   NEONATOX_STRICT_SYSROOT=1). Keys currently honored:
+     library_path  -> sent as LD_LIBRARY_PATH (default: NEO_SYSROOT dirs)
+     proxy         -> sent as LD_PRELOAD (default: NEO_BINDIR/libnrld-proxy.so)
+   The sysroot root itself is NOT runtime-configurable by design: it stays as
+   the build-time NEO_SYSROOT default (overridable with a recompile/Meson). */
+#define NRLCONF_PATH "/etc/nrld.conf"
 
-static int config_enforces_strict(void) {
-    if (!file_exists(NRLCONF_PATH)) return 0;
+static char g_conf_libpath[4096];
+static char g_conf_proxy[256];
+static int  g_conf_strict = 0;
+
+static int conf_token_is(const char *tok, long tlen, const char *word) {
+    long wl = 0;
+    while (word[wl]) wl++;
+    if (tlen != wl) return 0;
+    for (long i = 0; i < wl; i++) if (tok[i] != word[i]) return 0;
+    return 1;
+}
+
+static void load_nrld_conf(void) {
+    g_conf_libpath[0] = '\0';
+    g_conf_proxy[0] = '\0';
+    g_conf_strict = 0;
+    if (!file_exists(NRLCONF_PATH)) return;
     long fd = syscall2(SYS_open, (long)NRLCONF_PATH, 0);
-    if (fd < 0) return 0;
-    char buf[1024];
-    long n = read_at(fd, 0, buf, sizeof(buf));
+    if (fd < 0) return;
+    char buf[4096];
+    long n = read_at(fd, 0, buf, sizeof(buf) - 1);
     syscall1(SYS_close, fd);
-    if (n <= 0) return 0;
-    for (long i = 0; i < n; i++) {
-        if ((buf[i] == 's' || buf[i] == 'S') &&
-            i + 6 < n &&
-            (buf[i+1] == 't' || buf[i+1] == 'T') &&
-            (buf[i+2] == 'r' || buf[i+2] == 'R') &&
-            (buf[i+3] == 'i' || buf[i+3] == 'I') &&
-            (buf[i+4] == 'c' || buf[i+4] == 'C') &&
-            (buf[i+5] == 't' || buf[i+5] == 'T'))
-            return 1;
+    if (n <= 0) return;
+    buf[n] = '\0';
+    long p = 0;
+    while (p < n) {
+        if (buf[p] == '#') {               /* comment to end of line */
+            while (p < n && buf[p] != '\n') p++;
+            continue;
+        }
+        if (buf[p] == ' ' || buf[p] == '\t' ||
+            buf[p] == '\n' || buf[p] == '\r') { p++; continue; }
+        long start = p;
+        while (p < n && buf[p] != ' ' && buf[p] != '\t' &&
+               buf[p] != '\n' && buf[p] != '\r') p++;
+        long tlen = p - start;
+        long eq = -1;
+        for (long i = 0; i < tlen; i++)
+            if (buf[start + i] == '=') { eq = i; break; }
+        if (eq < 0) {
+            if (conf_token_is(buf + start, tlen, "strict")) g_conf_strict = 1;
+            continue;
+        }
+        long klen = eq, vlen = tlen - eq - 1;
+        const char *val = buf + start + eq + 1;
+        if (conf_token_is(buf + start, klen, "library_path") &&
+            vlen > 0 && vlen < (long)sizeof(g_conf_libpath)) {
+            for (long i = 0; i < vlen; i++) g_conf_libpath[i] = val[i];
+            g_conf_libpath[vlen] = '\0';
+        } else if (conf_token_is(buf + start, klen, "proxy") &&
+                   vlen > 0 && vlen < (long)sizeof(g_conf_proxy)) {
+            for (long i = 0; i < vlen; i++) g_conf_proxy[i] = val[i];
+            g_conf_proxy[vlen] = '\0';
+        }
     }
-    return 0;
 }
 
 static int resolve_path(const char *relative, char *absolute, int max_len) {
@@ -662,17 +715,46 @@ static void get_directory(const char *path, char *dir, int max_len) {
     else my_strcpy(dir, ".");
 }
 
+/* Launcher estilo mozilla (firefox/firefox-bin, thunderbird/thunderbird-bin,
+   ...): el target es un ELF pequeno cuyo main resuelve el binario real
+   desde readlink("/proc/self/exe") y le anade "-bin". En modo usuario nrld
+   ejecuta la copia parcheada <base>-nrld-<pid>; como /proc/self/exe es esa
+   copia, la derivacion da <base>-nrld-<pid>-bin -> "Exec failed with error:
+   No such file or directory" (regresion Firefox moderno + ESR). Si en el
+   mismo dir existe el hermano <base>-bin (ELF), ejecutar directamente ese
+   binario real evita el launcher y su derivacion. Solo aplica en modo
+   usuario; en modo ROOT el launcher corre nativo y resuelve bien. */
+static const char *launcher_bin_redirect(const char *run_path) {
+    static char g_alt_bin[4096];
+    const char *base = run_path;
+    for (const char *p = run_path; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+
+    get_directory(run_path, g_alt_bin, sizeof(g_alt_bin));
+    if (my_strlen(g_alt_bin) + my_strlen(base) + 6 >= sizeof(g_alt_bin)) {
+        return 0;
+    }
+    my_strcat(g_alt_bin, "/");
+    my_strcat(g_alt_bin, base);
+    my_strcat(g_alt_bin, "-bin");
+
+    if (!file_exists(g_alt_bin)) return 0;
+    if (!is_elf(g_alt_bin)) return 0;
+    return g_alt_bin;
+}
+
 typedef struct { long a_type; long a_val; } Elf64_auxv_t;
 #define AT_NULL    0
 #define AT_EXECFN  31
 
-#define REAL_LOADER   "/usr/lib/glibc6/usr/lib/ld-linux-x86-64.so.2"
-#define FAKE_LOADER   "/usr/lib/glibc6/usr/bin/nrld"
+#define REAL_LOADER   NEO_SYSROOT "/usr/lib/ld-linux-x86-64.so.2"
+#define FAKE_LOADER   NEO_BINDIR "/nrld"
 #define INTERP_PATH   "/lib64/ld-linux-x86-64.so.2"
 #define INTERP_TMP    "/lib64/ld-linux-x86-64.so.2.tmp"
-#define SYSROOT_LIBS  "/usr/lib/glibc6/usr/lib:/usr/lib/glibc6/lib"
-#define GCONV_DIR     "/usr/lib/glibc6/usr/lib/gconv"
-#define PROXY_LIB     "/usr/lib/glibc6/lib/libnrld-proxy.so"
+#define SYSROOT_LIBS  NEO_SYSROOT "/usr/lib:" NEO_SYSROOT "/lib"
+#define GCONV_DIR     NEO_SYSROOT "/usr/lib/gconv"
+#define PROXY_LIB     NEO_BINDIR "/libnrld-proxy.so"
 
 /* ------------------------------------------------------------------ */
 /*  Interp-patched copy (fixes /proc/self/exe for app-spawned kids).   */
@@ -693,7 +775,7 @@ typedef struct { long a_type; long a_val; } Elf64_auxv_t;
 /*  (LD_LIBRARY_PATH/LD_PRELOAD/GCONV_PATH/NEONATOX_*) is inherited,    */
 /*  so the in-process loader configures itself identically.             */
 /*                                                                      */
-/*  Each run leaves <dir>/<base>.nrld-<pid> behind (children keep re-   */
+/*  Each run leaves <dir>/<base>-nrld-<pid> behind (children keep re-   */
 /*  exec'ing that exact path). To avoid garbage piling up, the next run */
 /*  for the same <base> sweeps old copies: a copy is kept only while    */
 /*  some live process still has it as /proc/self/exe (its app tree is   */
@@ -769,11 +851,20 @@ static void sweep_stale_interp_copies(const char *src) {
             struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
             if (de->d_reclen == 0) break;
             const char *nm = de->d_name;
-            if (!my_starts_with(nm, base) || !my_starts_with(nm + base_len, ".nrld-")) {
+            /* Match "<base>-nrld-<pid>" (kept copy from a previous run).
+               Also sweep the legacy dotted format ".<base>.nrld-<pid>"
+               (nomeclatura previa al cambio a guiones). */
+            const char *suf;
+            if (my_starts_with(nm, base) && my_starts_with(nm + base_len, "-nrld-")) {
+                suf = nm + base_len + 6;
+            } else if (nm[0] == '.' && my_starts_with(nm + 1, base) &&
+                       my_starts_with(nm + 1 + base_len, ".nrld-")) {
+                suf = nm + 1 + base_len + 6;
+            } else {
                 off += de->d_reclen;
                 continue;
             }
-            const char *d = nm + base_len + 6;
+            const char *d = suf;
             int digits = (*d != 0);
             for (const char *q = d; *q; q++) if (*q < '0' || *q > '9') { digits = 0; break; }
             if (!digits) { off += de->d_reclen; continue; }
@@ -802,7 +893,13 @@ static const char *make_interp_patched_copy(const char *src) {
     unsigned long e_phnum = *(unsigned short *)(header + 56);
     if (e_phentsize < 56 || e_phnum == 0) { syscall1(SYS_close, fd); return 0; }
 
-    /* Output path: same dir as src -> "<dir>/<base>.nrld-<pid>". */
+    /* Output path: same dir as src -> "<dir>/<base>-nrld-<pid>". Uses the
+       base name unchanged, no leading dot and no dotted suffix, so the copy
+       is a visible, plain-named file (cosmetic; the Chromium/Electron SIGTRAP
+       was actually the proxy's /proc/self/exe rewrite, now gated to
+       loader-as-main only). The "-nrld-<pid>" suffix keeps the per-run copy
+       unique (multi-instance) so children that re-exec /proc/self/exe keep
+       using their own copy, which the residue sweep still matches. */
     const char *base = src;
     for (const char *p = src; *p; p++) if (*p == '/') base = p + 1;
     unsigned long dir_len = (unsigned long)(base - src);
@@ -813,7 +910,7 @@ static const char *make_interp_patched_copy(const char *src) {
     for (i = 0; i < dir_len; i++) g_interp_bin[i] = src[i];
     g_interp_bin[dir_len] = '\0';
     my_strcat(g_interp_bin, base);
-    my_strcat(g_interp_bin, ".nrld-");
+    my_strcat(g_interp_bin, "-nrld-");
     my_strcat(g_interp_bin, pidbuf);
 
     long srcfd = syscall2(SYS_open, (long)src, 0);
@@ -874,6 +971,7 @@ static char g_gconv[256];
 static char g_lib_paths[16384];
 static char g_real_exe[4096];
 static char g_ld_preload[512];
+static char g_sysroot_env[512];
 static char g_strict_env[64];
 static char g_appdir_env[512];
 static char g_qt_env[1024];
@@ -906,12 +1004,17 @@ static void print_usage_help(void) {
     print_msg("     en subdirectorios no estandar del sysroot (gvfs/, pulseaudio/, ...)\n");
     print_msg("     y anade ese dir a LD_LIBRARY_PATH / --library-path.\n");
     print_msg("  5. Corrige DT_NEEDED absolutos creando copias parcheadas en\n");
-    print_msg("     /tmp/nrld-<pid>/ (traducidos a soname resoluble por --library-path).\n");
-    print_msg("  6. Executa una copia parcheada de BIN en su propio directorio cuyo\n");
-    print_msg("     PT_INTERP apunta al loader glibc real (cargado in-process por el\n");
-    print_msg("     kernel): /proc/self/exe queda en el dir de la app, los hijos que\n");
-    print_msg("     re-ejecutan su propio binario funcionan. LD_PRELOAD con el proxy\n");
-    print_msg("     libnrld-proxy.so (scan strict de dlopen).\n");
+    print_msg("     /tmp/nrld-patch-<pid>/ (traducidos a soname resoluble por --library-path).\n");
+    print_msg("  6. Executa una copia parcheada (<base>-nrld-<pid>) de BIN en su\n");
+    print_msg("     propio directorio cuyo PT_INTERP apunta al loader glibc real (cargado\n");
+    print_msg("     in-process por el kernel): /proc/self/exe queda en el dir de la app,\n");
+    print_msg("     los hijos que re-ejecutan su propio binario funcionan. LD_PRELOAD con\n");
+    print_msg("     el proxy libnrld-proxy.so (scan strict de dlopen).\n");
+    print_msg("\n");
+    print_msg("Configuracion (/etc/nrld.conf, lo escribe el instalador; key = value):\n");
+    print_msg("  library_path = <dirs>      LD_LIBRARY_PATH (default: dirs del sysroot)\n");
+    print_msg("  proxy        = <ruta>      LD_PRELOAD (default: NEO_BINDIR/libnrld-proxy.so)\n");
+    print_msg("  strict                      modo estricto global (sin env)\n");
     print_msg("\n");
     print_msg("Modo estricto del sysroot (aislacion musl<->glibc):\n");
     print_msg("  NEONATOX_STRICT_SYSROOT=1 ./BIN    falla limpio si falta algo\n");
@@ -921,6 +1024,7 @@ static void print_usage_help(void) {
     print_msg("Variables de entorno que nrld importa/exporta:\n");
     print_msg("  NEONATOX_STRICT_SYSROOT   strict por env (0/1)\n");
     print_msg("  NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)\n");
+    print_msg("  NEONATOX_SYSROOT          root del sysroot (la lee el proxy)\n");
     print_msg("  NEONATOX_APPDIR           raiz extraida de un AppImage\n");
     print_msg("  NEONATOX_DUMPENV          dump del entorno del hijo a /tmp (debug)\n");
     print_msg("  QT_PLUGIN_PATH            dir del plugin de plataforma Qt (si aplica)\n");
@@ -942,9 +1046,14 @@ void _start_main(long *sp) {
        pid aqui permite correlacionar los warnings con la instancia de nrld. */
     char pidb[16];
     uint_to_str(syscall0(SYS_getpid), pidb, sizeof(pidb));
-    print_msg("[DEBUG] NeonatoX iniciado (pid ");
+    print_msg("[DEBUG] Starting RLDispatcher (pid ");
     print_msg(pidb);
     print_msg(")\n");
+
+    /* Cargar /etc/nrld.conf (host): strict global + overrides library_path/
+       proxy escritos por el instalador. Los defaults (NEO_SYSROOT dirs /
+       NEO_BINDIR proxy) aplican si el archivo no existe. */
+    load_nrld_conf();
 
     char **envp_end = envp;
     while (*envp_end) envp_end++;
@@ -984,11 +1093,11 @@ void _start_main(long *sp) {
     if (manual) {
         target_bin = argv[1];
         orig_args_start = 2;
-        print_msg("[DEBUG] Modo manual (argv[1] es path)\n");
+        print_msg("[DEBUG] Manual mode (argv[1] es path)\n");
     } else if (execfn) {
         target_bin = execfn;
         orig_args_start = 1;
-        print_msg("[DEBUG] Modo directo (usando AT_EXECFN)\n");
+        print_msg("[DEBUG] Direct mode (using AT_EXECFN)\n");
     } else {
         print_err("[DEBUG] ERROR: No se pudo determinar el binario\n");
         syscall1(SYS_exit, 1);
@@ -1070,7 +1179,7 @@ void _start_main(long *sp) {
     for (char **e = envp; *e; e++) {
         if (my_starts_with(*e, "NEONATOX_STRICT_SYSROOT=1")) { sysroot_strict = 1; strict_in_env = 1; break; }
     }
-    if (!sysroot_strict && config_enforces_strict()) {
+    if (!sysroot_strict && g_conf_strict) {
         sysroot_strict = 1;
         print_msg("[INFO] Modo estricto activado por " NRLCONF_PATH "\n");
     }
@@ -1113,6 +1222,50 @@ void _start_main(long *sp) {
         }
     }
 
+    if (g_appimage_extracted && g_appimage_script) {
+        /* AppRun es un script #! (entrada canonica del AppImage type-2: el
+           runtime real solo execa AppRun). Ejecutarlo tal cual como haria ese
+           runtime: bash (musl) del host corre el script y el script a su vez
+           execa el ELF interno (heroic, etc.), que RE-entra a nrld como interp
+           de un binario normal en este dir (modo usuario, copia parcheada).
+           Con el env heredado + APPDIR=<raiz extraida> (que es lo que setea el
+           runtime real y sin lo cual los scripts tipo Heroic no resuelven "$1").
+           Nada de loader/copia de nrld aqui: meter el proxy glibc en el bash
+           musl lo contaminaria; los LD_* correctos los construye la siguiente
+           invocacion de nrld cuando el script execa el ELF interno. */
+        print_msg("[ADV] AppRun es script (canonico): exec directo con APPDIR\n");
+        char appdir_var[4100];
+        my_strcpy(appdir_var, "APPDIR=");
+        my_strcat(appdir_var, g_appimage_root);
+        char appimage_var[4100];
+        my_strcpy(appimage_var, "APPIMAGE=");
+        my_strcat(appimage_var, target_bin_abs);
+        int se_count = 0;
+        for (char **e = envp; *e; e++) {
+            if (!my_starts_with(*e, "APPDIR=") && !my_starts_with(*e, "APPIMAGE=")) se_count++;
+        }
+        char *script_envp[se_count + 3];
+        int se_idx = 0;
+        for (char **e = envp; *e; e++) {
+            if (!my_starts_with(*e, "APPDIR=") && !my_starts_with(*e, "APPIMAGE=")) script_envp[se_idx++] = *e;
+        }
+        script_envp[se_idx++] = appdir_var;
+        script_envp[se_idx++] = appimage_var;
+        script_envp[se_idx] = (char *)0;
+        int s_argc = argc - orig_args_start;
+        char *sargv[s_argc + 2];
+        sargv[0] = (char *)g_appimage_bin;
+        for (int i = 0; i < s_argc; i++) {
+            sargv[1 + i] = argv[orig_args_start + i];
+        }
+        sargv[s_argc + 1] = (char *)0;
+        long sret = syscall3(SYS_execve, (long)sargv[0], (long)sargv, (long)script_envp);
+        (void)sret;
+        print_err("[DEBUG] ERROR: execve del AppRun script falló\n");
+        syscall1(SYS_exit, 1);
+        return;
+    }
+
     {
         int missing = check_needed_libs(guard_bin, lib_root);
         if (missing > 0 && sysroot_strict) {
@@ -1148,7 +1301,12 @@ void _start_main(long *sp) {
         }
     }
 
-    my_strcpy(g_new_ld_path, "LD_LIBRARY_PATH=");
+    /* Receta verificada: ".:" (PWD) al inicio de LD_LIBRARY_PATH. Cada app
+       glibc recibe este LD_LIBRARY_PATH aqui (el perfil global ya NO lo pone:
+       esa via envenenaba los binarios musl). Los hijos heredan este env;
+       los que lo pierdan (sandbox) resuelven via el cache ldconfig del
+       sysroot. */
+    my_strcpy(g_new_ld_path, "LD_LIBRARY_PATH=.:");
     if (g_patch_dir_set) {
         /* Patched shadows must win over the sysroot copies. */
         my_strcat(g_new_ld_path, g_patch_dir);
@@ -1157,7 +1315,7 @@ void _start_main(long *sp) {
     my_strcat(g_new_ld_path, lib_root);
     append_lib_subdirs(g_new_ld_path, lib_root);
     my_strcat(g_new_ld_path, ":");
-    my_strcat(g_new_ld_path, SYSROOT_LIBS);
+    my_strcat(g_new_ld_path, g_conf_libpath[0] ? g_conf_libpath : SYSROOT_LIBS);
     if (existing_ld_path) {
         my_strcat(g_new_ld_path, ":");
         my_strcat(g_new_ld_path, existing_ld_path);
@@ -1174,10 +1332,15 @@ void _start_main(long *sp) {
     my_strcat(g_lib_paths, lib_root);
     append_lib_subdirs(g_lib_paths, lib_root);
     my_strcat(g_lib_paths, ":");
-    my_strcat(g_lib_paths, SYSROOT_LIBS);
+    my_strcat(g_lib_paths, g_conf_libpath[0] ? g_conf_libpath : SYSROOT_LIBS);
 
     my_strcpy(g_real_exe, "NEONATOX_REAL_EXE=");
     my_strcat(g_real_exe, real_exe);
+
+    /* Root del sysroot para el proxy (allowlist de dlopen + redireccion): el
+       proxy lo honra si esta seteada, con este default como compile-time. */
+    my_strcpy(g_sysroot_env, "NEONATOX_SYSROOT=");
+    my_strcat(g_sysroot_env, NEO_SYSROOT);
 
     if (g_patch_dir_set) {
         /* Allow the proxy (which enforces the sysroot dlopen allowlist) to
@@ -1200,9 +1363,9 @@ void _start_main(long *sp) {
     }
 
     my_strcpy(g_ld_preload, "LD_PRELOAD=");
-    my_strcat(g_ld_preload, PROXY_LIB);
+    my_strcat(g_ld_preload, g_conf_proxy[0] ? g_conf_proxy : PROXY_LIB);
 
-    char *new_envp[clean_count + 9];
+    char *new_envp[clean_count + 10];
     int env_idx = 0;
 
     for (char **e = envp; *e; e++) {
@@ -1221,6 +1384,7 @@ void _start_main(long *sp) {
     new_envp[env_idx++] = g_gconv;
     new_envp[env_idx++] = g_real_exe;
     new_envp[env_idx++] = g_ld_preload;
+    new_envp[env_idx++] = g_sysroot_env;
     if (sysroot_strict && !strict_in_env) {
         new_envp[env_idx++] = g_strict_env;
     }
@@ -1238,9 +1402,20 @@ void _start_main(long *sp) {
     int orig_argc = argc - orig_args_start;
 
     int have_root = can_write_dir("/lib64");
-    
+
     print_msg("[DEBUG] Permisos root: ");
     print_msg(have_root ? "SI\n" : "NO\n");
+
+    /* Launcher mozilla: en modo usuario el launcher deriva <base>-bin desde
+       /proc/self/exe (la copia) y falla; usar el binario real directamente. */
+    const char *exec_path = run_path;
+    if (!have_root) {
+        const char *alt_bin = launcher_bin_redirect(run_path);
+        if (alt_bin) {
+            print_msg("[ADV] Launcher con hermano -bin detectado: ejecutando el binario real\n");
+            exec_path = alt_bin;
+        }
+    }
 
     if (have_root) {
         print_msg("[DEBUG] Modo ROOT: fork + swap symlink\n");
@@ -1300,10 +1475,10 @@ void _start_main(long *sp) {
 
     print_msg("[DEBUG] Modo USUARIO: exec de copia con PT_INTERP -> loader real in-process\n");
 
-    const char *interp_run = make_interp_patched_copy(run_path);
+    const char *interp_run = make_interp_patched_copy(exec_path);
     if (interp_run) {
         char *bin_argv[orig_argc + 4];
-        bin_argv[0] = (char *)run_path;
+        bin_argv[0] = (char *)exec_path;
         for (int i = 0; i < orig_argc; i++) {
             bin_argv[1 + i] = argv[orig_args_start + i];
         }
@@ -1328,7 +1503,7 @@ void _start_main(long *sp) {
     loader_argv[0] = REAL_LOADER;
     loader_argv[1] = "--library-path";
     loader_argv[2] = g_lib_paths;
-    loader_argv[3] = (char *)run_path;
+    loader_argv[3] = (char *)exec_path;
     for (int i = 0; i < orig_argc; i++) {
         loader_argv[4 + i] = argv[orig_args_start + i];
     }
@@ -1339,7 +1514,7 @@ void _start_main(long *sp) {
     print_msg(" --library-path ");
     print_msg(g_lib_paths);
     print_msg(" ");
-    print_msg(run_path);
+    print_msg(exec_path);
     print_msg("\n");
 
     long ret = syscall3(SYS_execve, (long)loader_argv[0], (long)loader_argv, (long)new_envp);

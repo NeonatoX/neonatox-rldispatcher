@@ -1,5 +1,5 @@
 // proxy_readlink.c
-// Compilar con: gcc -shared -fPIC -o /usr/lib/glibc6/usr/lib/libnrld-proxy.so proxy_readlink.c
+// Compilar con: gcc -nostdlib -shared -fPIC -o /usr/lib/neonatox/libnrld-proxy.so proxy_readlink.c
 
 #define _GNU_SOURCE
 #include <unistd.h>
@@ -11,7 +11,34 @@
 #include <dlfcn.h>
 #include <link.h>
 
+/* Compile-time defaults (same knobs as nrld; Meson passes -D...). Overridable
+   at runtime via NEONATOX_SYSROOT for the sysroot root. */
+#ifndef NEO_SYSROOT
+#define NEO_SYSROOT   "/usr/lib/glibc6"
+#endif
+#ifndef NEO_BINDIR
+#define NEO_BINDIR    "/usr/lib/neonatox"
+#endif
+
 static int proxy_log_fd = -1;
+
+/* glibc-host guard: this .so is LD_PRELOAD'd by EVERY dynamic binary started
+   from a shell that sources the nrld profile, including musl ones. Under a
+   musl loader it must be a completely transparent no-op: no /proc/self/exe
+   rewrite, no redirect, no strict scan, no crash handlers. Detected once at
+   init: glibc provides the libc.so.6 soname, musl does not. The interposers
+   only act when this is 1. */
+static int g_glibc_host = 1;
+
+static char sysroot_root[4096];
+static size_t sysroot_root_len = 0;
+
+static int under_sysroot(const char *p) {
+    if (!p || !*p) return 0;
+    if (sysroot_root_len == 0) return 0;
+    if (strncmp(p, sysroot_root, sysroot_root_len) != 0) return 0;
+    return p[sysroot_root_len] == '/' || p[sysroot_root_len] == '\0';
+}
 
 static void proxy_logf(const char *msg) {
     /* Only appends to the NEONATOX_PROXY_LOG file (never to stderr). */
@@ -51,6 +78,38 @@ static size_t appdir_len = 0;
 static int crashdump_on = 0;
 static void install_crashdump(void);
 
+/* Kernel-mode discriminator for the readlink("/proc/self/exe") rewrite.
+   That rewrite is only a safety net for the loader-as-main fallback (no
+   patched copy), where the kernel's /proc/self/exe IS the loader. In normal
+   user mode the kernel /proc/self/exe is already the app (interp-patched
+   copy in the app dir); rewriting it to NEONATOX_REAL_EXE makes Chromium's
+   recursive self-exe resolution see a path that differs from the running
+   binary and die with SIGTRAP/NOTREACHED in early startup (verified live:
+   same clean-named Electron copy traps with NEONATOX_REAL_EXE set and runs
+   when the rewrite is skipped). Mode is fixed per process; detect once via a
+   raw readlink of /proc/self/exe (bypassing our interposed symbol). */
+static int loader_as_main = 0;
+
+static long raw_readlink(const char *path, char *out, size_t n) {
+    long rc;
+    __asm__ volatile("syscall"
+                     : "=a"(rc)
+                     : "a"(89 /* SYS_readlink */), "D"(path), "S"(out), "d"(n)
+                     : "rcx", "r11", "memory");
+    return rc;
+}
+
+static void detect_loader_main(void) {
+    char selfbuf[4096];
+    long n = raw_readlink("/proc/self/exe", selfbuf, sizeof(selfbuf));
+    if (n <= 0) { loader_as_main = (real_exe_path != NULL); return; }
+    if (n >= (long)sizeof(selfbuf)) n = (long)sizeof(selfbuf) - 1;
+    selfbuf[n] = '\0';
+    const char *b = selfbuf;
+    for (const char *p = selfbuf; *p; p++) if (*p == '/') b = p + 1;
+    loader_as_main = (strncmp(b, "ld-", 3) == 0);
+}
+
 static void pid_name(char *dst, size_t sz, const char *prefix, int pid) {
     size_t pl = strlen(prefix);
     if (pl >= sz - 4) return;
@@ -75,10 +134,62 @@ static void derive_allow_dir(void) {
     allow_dir_len = (n == 0) ? 1 : n;
 }
 
+/* dlopen path redirection table, built from the runtime sysroot root so the
+   mapping follows NEONATOX_SYSROOT (default: NEO_SYSROOT). Same semantics as
+   before: most host prefixes map into <root>/usr/lib/ in the sysroot. */
+static char g_rd[5][4096];
+struct redirect_map { const char *host; char *sys; };
+static struct redirect_map redirect_maps[8];
+
+static void build_redirect_maps(void) {
+    static const char *sufs[5] = { "/usr/lib/", "/usr/lib32/", "/usr/libx32/",
+                                   "/lib/", "/lib64/" };
+    size_t rl = sysroot_root_len;
+    for (int i = 0; i < 5; i++) {
+        size_t sl = strlen(sufs[i]);
+        if (rl + sl + 1 > sizeof(g_rd[i])) { g_rd[i][0] = '\0'; continue; }
+        memcpy(g_rd[i], sysroot_root, rl);
+        memcpy(g_rd[i] + rl, sufs[i], sl);
+        g_rd[i][rl + sl] = '\0';
+    }
+    static const char *hosts[8] = {
+        "/usr/lib/", "/usr/lib64/", "/usr/lib32/", "/usr/libx32/",
+        "/lib/", "/lib64/", "/usr/x86_64-linux-gnu/", "/usr/i386-linux-gnu/"
+    };
+    static const int targets[8] = { 0, 0, 1, 2, 3, 4, 0, 0 };
+    for (int i = 0; i < 8; i++) {
+        redirect_maps[i].host = hosts[i];
+        redirect_maps[i].sys = g_rd[targets[i]];
+    }
+}
+
 __attribute__((constructor))
 void init_proxy(void) {
+    /* glibc-host guard: la interposicion solo debe activarse bajo un glibc
+       real. NO sirve dlopen("libc.so.6"): en hosts musl con libc6-compat
+       (/usr/lib/libc.so.6 -> sysroot glibc) el dlopen tiene exito y el proxy
+       creeria estar en glibc, reescribiendo dlopen de paths musl -> la ruta
+       glibc del sysroot => musl roto. Discriminador robusto: gnu_get_libc_version
+       solo lo exporta glibc (verificado: ni en musl puro ni en musl con la libc
+       glibc dlopen'd en un namespace local). */
+    void *(*glibc_ver)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "gnu_get_libc_version");
+    g_glibc_host = (glibc_ver != NULL);
+
+    /* Sysroot root: NEONATOX_SYSROOT if set (nrld exports it), else the
+       compile-time default. Every allowlist/redirect comparison derives from
+       this. */
+    const char *sr = getenv("NEONATOX_SYSROOT");
+    if (!sr || !*sr) sr = NEO_SYSROOT;
+    size_t rn = strlen(sr);
+    if (rn >= sizeof(sysroot_root)) rn = sizeof(sysroot_root) - 1;
+    memcpy(sysroot_root, sr, rn);
+    sysroot_root[rn] = '\0';
+    sysroot_root_len = rn;
+    build_redirect_maps();
+
     // Leer la ruta real del binario desde una variable de entorno
     real_exe_path = getenv("NEONATOX_REAL_EXE");
+    detect_loader_main();
     derive_allow_dir();
     const char *s = getenv("NEONATOX_STRICT_SYSROOT");
     strict_sysroot = s && *s == '1';
@@ -99,7 +210,7 @@ void init_proxy(void) {
         appdir_len = n;
     }
     const char *cd = getenv("NEONATOX_CRASHDUMP");
-    if (cd && *cd == '1') {
+    if (g_glibc_host && cd && *cd == '1') {
         crashdump_on = 1;
         install_crashdump();
     }
@@ -109,7 +220,7 @@ void init_proxy(void) {
         /* heartbeat: si un proceso corre con LD_PRELOAD activo, aparece una
            linea por proceso aqui. Un ff-proxy.log con lineas "init" pero sin
            "Falta" prueba que el proxy cargo en los hijos y el scan paso. */
-        proxy_logf("[neonatox-proxy] init pid=");
+        proxy_logf("[nrld-proxy] init pid=");
         proxy_logf_u64((unsigned long long)getpid());
         proxy_logf("\n");
         (void)0;
@@ -136,8 +247,10 @@ void init_proxy(void) {
 }
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
-    // Si están preguntando por /proc/self/exe y tenemos la ruta real
-    if (real_exe_path && pathname && strcmp(pathname, "/proc/self/exe") == 0) {
+    // Solo reescribir /proc/self/exe cuando el kernel realmente apunta al
+    // loader (modo cargador-as-main, sin copia parcheada). En modo usuario la
+    // respuesta del kernel ya es la app: reescribirla rompe Chromium.
+    if (g_glibc_host && real_exe_path && loader_as_main && pathname && strcmp(pathname, "/proc/self/exe") == 0) {
         size_t len = strlen(real_exe_path);
         if (len >= bufsiz) {
             len = bufsiz - 1;
@@ -183,7 +296,9 @@ static int is_rtld_path(const char *p) {
 static int is_allowed_path(const char *path) {
     if (!path) return 1;                      /* no resolved name: allow */
     if (is_rtld_path(path)) return 1;         /* the running glibc loader */
-    if (strncmp(path, "/usr/lib/glibc6/", 16) == 0) return 1;  /* sysroot */
+    if (under_sysroot(path)) return 1;        /* resolved inside the sysroot */
+    if (strncmp(path, NEO_BINDIR, sizeof(NEO_BINDIR) - 1) == 0 &&
+        path[sizeof(NEO_BINDIR) - 1] == '/') return 1;  /* our own install dir */
     if (patched_dir_len && strncmp(path, patched_dir, patched_dir_len) == 0) return 1; /* runtime patches */
     if (appdir_len && strncmp(path, appdir, appdir_len) == 0) return 1; /* extracted AppImage tree */
     if (allow_dir_len && strncmp(path, allow_dir, allow_dir_len) == 0) return 1;
@@ -193,9 +308,11 @@ static int is_allowed_path(const char *path) {
 static void reject_handle(void *h, const char *name) {
     void (*real_dlclose)(void *) = (void (*)(void *))dlsym(RTLD_NEXT, "dlclose");
     if (real_dlclose && h) real_dlclose(h);
-    proxy_err("[neonatox] Falta la libreria glibc para ejecutar la app: ");
+    proxy_err("[neonatox] The following glibc library is missing to run the app: ");
     proxy_err(name ? name : "(sin nombre)");
-    proxy_err(" (no existe en /usr/lib/glibc6). Instala las librerias glibc faltantes.\n");
+    proxy_err(" (no existe en el sysroot ");
+    proxy_err(sysroot_root);
+    proxy_err("). Instala las librerias glibc faltantes.\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -241,7 +358,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv) {
 #if defined(__x86_64__)
     unsigned long long rip = uc->uc_mcontext.gregs[REG_RIP];
 #endif
-    proxy_err("[neonatox-crash] pid=");
+    proxy_err("[nrld-crash] pid=");
     write_u64((unsigned long long)getpid());
     proxy_err(" sig=");
     write_hex((unsigned long long)(unsigned)sig);
@@ -260,7 +377,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv) {
     }
     if (n > 0) {
         if (comm[n-1] == '\n') comm[n-1] = '\0';
-        proxy_err("[neonatox-crash] comm=");
+        proxy_err("[nrld-crash] comm=");
         proxy_err(comm);
         proxy_err("\n");
     }
@@ -271,7 +388,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv) {
     size_t used = 0;
     int mfd = open(mf, O_RDONLY);
     if (mfd < 0) {
-        proxy_err("[neonatox-crash] no maps\n");
+        proxy_err("[nrld-crash] no maps\n");
         _exit(128 + sig);
     }
     while (used < sizeof(buf) - 1) {
@@ -325,7 +442,7 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv) {
         int is_crashing = 0;
 #endif
         if (is_crashing) {
-            proxy_err("[neonatox-crash] -> faul en ");
+            proxy_err("[nrld-crash] -> faul en ");
             proxy_err(path && *path ? path : "(anon/ejecutable)");
             proxy_err("+");
             write_hex(rip - a);
@@ -334,12 +451,17 @@ static void crash_handler(int sig, siginfo_t *si, void *ucv) {
         if (path && *path && musl_shown < 32) {
             const char *q = path;
             int is_usl = 0;
-            if (strncmp(q, "/usr/lib/", 9) == 0 && strncmp(q, "/usr/lib/glibc6/", 16) != 0) is_usl = 1;
-            if (strncmp(q, "/usr/lib64/", 11) == 0 && strncmp(q, "/usr/lib64/glibc6/", 18) != 0) is_usl = 1;
-            if (strncmp(q, "/lib/", 5) == 0 && strncmp(q, "/lib/glibc6/", 12) != 0) is_usl = 1;
-            if (strncmp(q, "/lib64/", 7) == 0 && strncmp(q, "/lib64/glibc6/", 14) != 0) is_usl = 1;
+            /* Host lib dirs (musl builds live here on this host), EXCLUDING
+               anything under the resolved sysroot root. */
+            if (strncmp(q, "/usr/lib/", 9) == 0 || strncmp(q, "/usr/lib64", 10) == 0 ||
+                strncmp(q, "/usr/lib32", 10) == 0 || strncmp(q, "/usr/libx32", 11) == 0 ||
+                strncmp(q, "/lib/", 5) == 0 || strncmp(q, "/lib64/", 7) == 0 ||
+                strncmp(q, "/usr/x86_64-linux-gnu/", 21) == 0 ||
+                strncmp(q, "/usr/i386-linux-gnu/", 19) == 0) {
+                if (!under_sysroot(q)) is_usl = 1;
+            }
             if (is_usl) {
-                proxy_err("[neonatox-crash]   musl-map: ");
+                proxy_err("[nrld-crash]   musl-map: ");
                 proxy_err(path);
                 proxy_err("\n");
                 musl_shown++;
@@ -466,24 +588,14 @@ static void *verify_dlopen_handle(void *h, const char *filename) {
 /* ------------------------------------------------------------------ */
 static const char *redirect_to_sysroot(const char *path) {
     static char out[4096];
-    static const struct { const char *host, *sys; } maps[] = {
-        { "/usr/lib/",   "/usr/lib/glibc6/usr/lib/" },
-        { "/usr/lib64/", "/usr/lib/glibc6/usr/lib/" },
-        { "/usr/lib32/", "/usr/lib/glibc6/usr/lib32/" },
-        { "/usr/libx32/", "/usr/lib/glibc6/usr/libx32/" },
-        { "/lib/",       "/usr/lib/glibc6/lib/" },
-        { "/lib64/",     "/usr/lib/glibc6/lib64/" },
-        { "/usr/x86_64-linux-gnu/", "/usr/lib/glibc6/usr/lib/" },
-        { "/usr/i386-linux-gnu/",   "/usr/lib/glibc6/usr/lib/" },
-    };
     if (!path || !*path || path[0] != '/') return path;
-    for (unsigned i = 0; i < sizeof(maps)/sizeof(maps[0]); i++) {
-        size_t hl = strlen(maps[i].host);
-        if (strncmp(path, maps[i].host, hl) != 0) continue;
+    for (int i = 0; i < 8; i++) {
+        size_t hl = strlen(redirect_maps[i].host);
+        if (strncmp(path, redirect_maps[i].host, hl) != 0) continue;
         const char *rest = path + hl;
-        size_t total = strlen(maps[i].sys) + strlen(rest) + 1;
+        size_t total = strlen(redirect_maps[i].sys) + strlen(rest) + 1;
         if (total > sizeof(out)) break;
-        strcpy(out, maps[i].sys);
+        strcpy(out, redirect_maps[i].sys);
         strcat(out, rest);
         if (access(out, R_OK) == 0) return out;
         break;
@@ -494,6 +606,7 @@ static const char *redirect_to_sysroot(const char *path) {
 void *dlopen(const char *filename, int flag) {
     void *(*real_dlopen)(const char *, int);
     real_dlopen = (void *(*)(const char *, int))dlsym(RTLD_NEXT, "dlopen");
+    if (!g_glibc_host) return real_dlopen ? real_dlopen(filename, flag) : NULL;
     const char *use = redirect_to_sysroot(filename);
     void *h = real_dlopen ? real_dlopen(use, flag) : NULL;
     if (!h) return h;
@@ -503,6 +616,7 @@ void *dlopen(const char *filename, int flag) {
 void *dlmopen(Lmid_t lmid, const char *filename, int flag) {
     void *(*real_dlmopen)(Lmid_t, const char *, int);
     real_dlmopen = (void *(*)(Lmid_t, const char *, int))dlsym(RTLD_NEXT, "dlmopen");
+    if (!g_glibc_host) return real_dlmopen ? real_dlmopen(lmid, filename, flag) : NULL;
     const char *use = redirect_to_sysroot(filename);
     void *h = real_dlmopen ? real_dlmopen(lmid, use, flag) : NULL;
     if (!h) return h;
