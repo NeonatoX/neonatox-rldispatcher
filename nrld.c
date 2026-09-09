@@ -13,6 +13,9 @@
 #define SYS_symlink  88
 #define SYS_getcwd   79
 #define SYS_getpid   39
+#define SYS_getppid  110
+#define SYS_kill     62
+#define SYS_nanosleep 35
 #define SYS_mkdir    83
 #define SYS_fstat    5
 #define SYS_openat   257
@@ -981,6 +984,69 @@ static char g_qt_env[1024];
    helpers above and the g_appimage_* / g_extra_libdirs globals. */
 #include "appimages.c"
 
+/* Limpieza per-ejecucion tras la muerte de la app. nrld hace execve de la
+   copia parcheada, asi que nrld ES la app y no puede borrarla al salir. Un
+   watchdog fork antes del exec espera a que el proceso padre (mismo pid que
+   la app tras el execve) muera y borra los residuos de este lanzamiento:
+   la copia <base>-nrld-<pid>, el dir ABI /tmp/nrld-<pid>, la extraccion del
+   AppImage y los parches de DT_NEEDED absolutos. El sweep de la siguiente
+   ejecucion queda como red de seguridad para casos marginales (app muerta
+   por kill/Ctrl-C: ambos procesos reciben la senal y el watchdog no llega a
+   limpiar; hijo superviviente que re-ejecuta la copia tras el padre). */
+static void cleanup_run_residue(const char *interp_copy) {
+    if (interp_copy) {
+        syscall2(SYS_unlink, (long)interp_copy, 0);
+    }
+    if (g_patched_bin[0]) {
+        syscall2(SYS_unlink, (long)g_patched_bin, 0);
+        char abidir[4096];
+        my_strcpy(abidir, g_patched_bin);
+        char *ls = abidir;
+        for (char *p = abidir; *p; p++) if (*p == '/') ls = p;
+        if (*ls == '/') {
+            *ls = '\0';
+            syscall1(SYS_rmdir, (long)abidir);
+        }
+    }
+    if (g_appimage_root[0]) rm_rf(g_appimage_root);
+    if (g_patch_dir[0]) rm_rf(g_patch_dir);
+}
+
+/* Espera a que el proceso padre (el pid que tras el execve es la app) ya no
+   exista. Se usa kill(pid,0) (senal de prueba) por si el padre sigue como
+   zombie antes de que el shell lo reapare; en ese caso se comprueba su
+   estado en /proc/<pid>/stat. */
+static void wait_parent_dead(void) {
+    long parent = syscall0(SYS_getppid);
+    for (;;) {
+        if (syscall2(SYS_kill, parent, 0) < 0) return;
+        char sp[40];
+        my_strcpy(sp, "/proc/");
+        char pb[24];
+        uint_to_str(parent, pb, sizeof(pb));
+        my_strcat(sp, pb);
+        my_strcat(sp, "/stat");
+        long fd = syscall2(SYS_open, (long)sp, 0);
+        if (fd >= 0) {
+            char buf[128];
+            long n = syscall3(SYS_read, fd, (long)buf, sizeof(buf) - 1);
+            syscall1(SYS_close, fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                for (long i = 0; i + 2 < n; i++) {
+                    if (buf[i] == ')' && buf[i + 1] == ' ' && buf[i + 2] == 'Z') {
+                        return;
+                    }
+                }
+            }
+        } else {
+            return;
+        }
+        long ts[2] = { 0, 30000000 };   /* 30 ms */
+        syscall2(SYS_nanosleep, (long)ts, 0);
+    }
+}
+
 static void print_usage_help(void) {
     print_msg("NeonatoX RLDispatcher (nrld) -- fake glibc linker para hosts musl\n");
     print_msg("\n");
@@ -1468,6 +1534,8 @@ void _start_main(long *sp) {
         syscall2(SYS_symlink, (long)FAKE_LOADER, (long)INTERP_TMP);
         syscall2(SYS_rename, (long)INTERP_TMP, (long)INTERP_PATH);
 
+        cleanup_run_residue(0);
+
         int exit_code = (status >> 8) & 0xFF;
         syscall1(SYS_exit, exit_code);
         return;
@@ -1487,6 +1555,15 @@ void _start_main(long *sp) {
         print_msg("[DEBUG] Ejecutando copia parcheada: ");
         print_msg(interp_run);
         print_msg("\n");
+
+        /* Watchdog: hijo que espera a la app (su padre, mismo pid tras el
+           execve) y borra la copia parcheada + residuos /tmp de este run. */
+        long wpid = syscall1(SYS_fork, 0);
+        if (wpid == 0) {
+            wait_parent_dead();
+            cleanup_run_residue(interp_run);
+            syscall1(SYS_exit, 0);
+        }
 
         long ret = syscall3(SYS_execve, (long)interp_run, (long)bin_argv, (long)new_envp);
         if (ret >= 0) return;
