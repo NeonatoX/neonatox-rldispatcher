@@ -29,23 +29,29 @@ entorno musl del host (sin mezclar dos libcs en un mismo proceso).
 | `nrld-profile.sh` | 17 | Plantilla de `/etc/profile.d/nrld-profile.sh`: env `LD_PRELOAD`/`LD_LIBRARY_PATH`/`NEONATOX_SYSROOT` para que las pestañas de Firefox/Brave hereden el proxy (ver **Uso**). |
 | `scripts/post-install.sh` | 20 | Refresca el cache `ldconfig` del sysroot glibc (`-n` con los dirs del sysroot); no fatal, salta con `DESTDIR`. |
 | `test/gen_probes.py` | 134 | Genera ELF64 x86-64 mínimos de prueba (struct-only, sin toolchain glibc): `need_vdpau` (NEEDED `libvdpau_trace.so.1`) y `need_missing` (NEEDED inexistente). |
-| `test/run_tests.sh` | 61 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl. |
+| `test/run_tests.sh` | 61 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl, **canal stdout limpio** (regresión de Investigación 05: nrld no escribe nada por defecto y el diagnóstico con `NRLD_DEBUG=3` va a stderr). |
 | `README.md` | — | Este documento. |
 | `AGENTS.md` | — | Notas técnicas de la aislación musl↔glibc (restricciones, comportamientos conocidos). |
 
 ---
 
-## nrld verboso (--help)
+## nrld silencioso por defecto (--help)
 
-`nrld` es verboso por diseño: imprime `[DEBUG]`, `[ADV]`, `[INFO]`, `[OK]` y `[ERROR]` a
-stderr explicando cada decisión. Con `nrld --help` (o `-h`) se obtiene el resumen completo:
+`nrld` es **silencioso por defecto** (nivel 0: solo `[ERROR]`) y escribe TODO su
+diagnóstico a **stderr**, nunca a stdout: a stdout vive la salida real del programa.
+Un loader real (`ld.so`) no escribe a stdout; re-efectuarlo allí rompía protocolos
+que capturan stdout (command substitution de `make`, `lto-wrapper`/`collect2`,
+pipes glibc). El log se reactiva por proceso con `NRLD_DEBUG=<0-3>` o globalmente
+con `log_level` en `/etc/nrld.conf`. Con `nrld --help` (o `-h`) se obtiene el
+resumen completo (impreso en stdout, es salida pedida):
 
 ```text
 NeonatoX RLDispatcher (nrld) -- fake glibc linker para hosts musl
 
 Uso:
-  nrld --help                        Muestra esta ayuda (modo verboso)
+  nrld --help                        Muestra esta ayuda
   nrld BIN [ARGOS...]                Ejecuta BIN glibc sobre el sysroot
+  nrld [--verbose|--quiet] BIN ...   Ajusta el log de la ejecucion
   (instalado como /lib64/ld-linux-x86-64.so.2: los binarios con ese
    PT_INTERP se ejecutan solos con ./BIN, sin invocar nrld a mano)
 
@@ -65,14 +71,13 @@ Que hace con BIN:
      propio directorio cuyo PT_INTERP apunta al loader glibc real (cargado
      in-process por el kernel): /proc/self/exe queda en el dir de la app,
      los hijos que re-ejecutan su propio binario funcionan. LD_PRELOAD con
-     el proxy libnrld-proxy.so (scan strict de dlopen). Si no hay PT_INTERP
-     (estatico/musl) o el dir no es escribible: fallback al loader como
-     principal (--library-path + LD_PRELOAD).
+     el proxy libnrld-proxy.so (scan strict de dlopen).
 
 Configuracion (/etc/nrld.conf, lo escribe el instalador; key = value):
   library_path = <dirs>      LD_LIBRARY_PATH (default: dirs del sysroot)
   proxy        = <ruta>      LD_PRELOAD (default: NEO_BINDIR/libnrld-proxy.so)
   strict                      modo estricto global (sin env)
+  log_level    = <0-3>       nivel de log global (ver 'Salida')
 
 Modo estricto del sysroot (aislacion musl<->glibc):
   NEONATOX_STRICT_SYSROOT=1 ./BIN    falla limpio si falta algo
@@ -80,6 +85,7 @@ Modo estricto del sysroot (aislacion musl<->glibc):
   (evita la mezcla de dos libcs en un proceso -> el SIGSEGV de strtod_l)
 
 Variables de entorno que nrld importa/exporta:
+  NRLD_DEBUG=<0-3>           log de ESTE proceso (0=off,1=warn,2=info,3=debug)
   NEONATOX_STRICT_SYSROOT   strict por env (0/1)
   NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)
   NEONATOX_SYSROOT          root del sysroot (la lee el proxy)
@@ -89,16 +95,20 @@ Variables de entorno que nrld importa/exporta:
    mensajes [neonatox]; NEONATOX_CRASHDUMP=1 activa los crash handlers)
   QT_PLUGIN_PATH            dir del plugin de plataforma Qt (si aplica)
 
-Salida (modo verboso por defecto):
-  [DEBUG] razonamiento interno      [ADV] avisos (faltantes/extraccion)
-  [INFO]  cambios de config         [OK]  todas las NEEDED en el sysroot
-  [ERROR] fallo (solo en strict)    [neonatox] mensajes del proxy
+Salida (SILENCIO por defecto; diagnostico SOLO a stderr):
+  nrld NO escribe a stdout: ahi vive la salida real del programa. Un
+  loader real (ld.so) nunca escribe a stdout; re-escribirlo ahi rompia
+  make $(shell ...), lto-wrapper/collect2 y los pipes glibc.
+  Nivel 0: solo [ERROR] (default)   Nivel 1: + [ADV] avisos
+  Nivel 2: + [INFO]/[OK]            Nivel 3: + [DEBUG] razonamiento
+  Reactiva el log con NRLD_DEBUG=3 ./BIN, 'nrld --verbose BIN',
+  o log_level = 3 en /etc/nrld.conf (global). --help si imprime (stdout).
 
 Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 ```
 
-> `--help`/`-h` solo actúa cuando se invoca `nrld` directamente (nunca como `PT_INTERP`,
-> para no robarle el flag a la app).
+> `--help`/`-h`, `--verbose`/`-v` y `--quiet`/`-q` solo actúan cuando se invoca
+> `nrld` directamente (nunca como `PT_INTERP`, para no robarle esos flags a la app).
 
 ---
 
@@ -108,7 +118,7 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 
 | Sección | Refs. | Qué resuelve |
 |---|---|---|
-| Helpers sin libc | syscalls `syscallN()`, `my_strlen/cpy/cat/cmp`, `print_msg/print_err`, `file_exists`, `uint_to_str`, `is_elf` | Todo el runtime freestanding (no hay `malloc`/`printf`). |
+| Helpers sin libc | syscalls `syscallN()`, `my_strlen/cpy/cat/cmp`, `print_msg/print_out/print_err`, `file_exists`, `uint_to_str`, `is_elf` | Todo el runtime freestanding (no hay `malloc`/`printf`). `print_msg` = log por niveles a **stderr** (silencio por defecto, ver `--help`), `print_out` = stdout (solo `--help`), `print_err` = errores duros a stderr siempre. |
 | `read_eident`, `copy_bytes` | ~123 | Lee `e_ident` y copia archivos en chunks (para parchear). |
 | `maybe_patch_abi_version` | ~166 | Los ELF type-2/AppImage llevan `EI_ABIVERSION != 0` y el loader glibc los **rechaza**; crea copia parcheada en `/tmp/nrld-<pid>/` y ejecuta la copia (el original queda intacto). |
 | Globals AppImage + forward `find_lib_in_sysroot` | ~230 | Estado compartido (antes del `#include "appimages.c"`). |
@@ -116,11 +126,11 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 | `get_needed_names` | ~319 | Parsea `DT_NEEDED` de un ELF (vía `PT_DYNAMIC`/`PT_LOAD`, vaddr→offset). |
 | `create_shadow_copy` | ~442 | `DT_NEEDED` con **ruta absoluta** (e.g. `libxul.so`): el loader ignora el path pero pierde la lib; se traduce a soname en una copia parcheada que `--library-path` sí resuelve. |
 | `scan_missing_libs` / `check_needed_libs` | ~524 / ~622 | Guard **transitivo** de cobertura NEEDED (BFS con visited, ciclo/dedup acotado a 512): recorre los `DT_NEEDED` de cada lib que resuelve dentro del sysroot. |
-| `load_nrld_conf` | ~650 | Lee `/etc/nrld.conf` (host, lo escribe el instalador) por raw syscalls: `library_path`/`proxy` (overrides de LD_LIBRARY_PATH/LD_PRELOAD) y token `strict` → todas las apps estrictas sin prefijo env. |
+| `load_nrld_conf` | ~650 | Lee `/etc/nrld.conf` (host, lo escribe el instalador) por raw syscalls: `library_path`/`proxy` (overrides de LD_LIBRARY_PATH/LD_PRELOAD), token `strict` → todas las apps estrictas sin prefijo env, y `log_level` (nivel de log global, sustituible por `NRLD_DEBUG` por proceso). |
 | `make_interp_patched_copy` | ~846 | Crea la copia parcheada `<base>-nrld-<pid>` en el dir del app (interp → loader real embebido al EOF, sin límite), self-sweep de copias viejas. |
 | `cleanup_run_residue` + watchdog | Antes del `execve` de la copia, nrld fork un **watchdog** que espera (poll `kill(getppid(),0)` + `/proc/<pid>/stat` a 30 ms) a que la app muera y borra los residuos del run: la copia `<base>-nrld-<pid>`, el dir ABI `/tmp/nrld-<pid>`, la extracción AppImage y los parches de DT_NEEDED absolutos — nada queda tras salir con normalidad (verificado: corridas repetidas dejan 0 copias). El self-sweep sigue como red de seguridad (kill/Ctrl-C matan al grupo antes de limpiar). |
 | `_start_main` | ~1001 | Entrada: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual (`nrld BIN`) vs directo (`PT_INTERP`), guard no-ELF, lectura de conf, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_REAL_EXE`/`NEONATOX_SYSROOT`, sanitización de `LD_*`, y el **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (`make_interp_patched_copy` → exec de la copia parcheada con el loader in-process; fallback al exec directo del loader real si no hay `PT_INTERP` o el dir no es escribible). |
-| `print_usage_help` | ~945 | El `--help` verbose. |
+| `print_usage_help` | ~945 | El `--help` (stdout, es salida pedida). |
 
 ### `appimages.c`
 

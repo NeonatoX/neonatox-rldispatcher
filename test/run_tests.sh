@@ -38,16 +38,23 @@ if [ "$copies" -gt 1 ]; then
 fi
 echo "ok 2: sweep deja <=1 copia ($copies)"
 
-# --- 3. NEEDED ausente: strict falla limpio; default avisa y deja correr
+# --- 3. NEEDED ausente: default SILENCIOSO; NRLD_DEBUG=1 avisa [ADV];
+#     strict falla limpio y reporta el sysroot incompleto
 "$NR" "$WORK/need_missing" >"$WORK/def.log" 2>&1
-grep -q "Falta la libreria glibc" "$WORK/def.log" \
-    || fail "3: default deberia avisar [ADV] por NEEDED ausente"
-if NEONATOX_STRICT_SYSROOT=1 "$NR" "$WORK/need_missing" >"$WORK/str.log" 2>&1; then
+if grep -q "Falta la libreria glibc" "$WORK/def.log"; then
+    fail "3: default deberia estar silencioso (sin [ADV]) ante NEEDED ausente"
+fi
+if ! NRLD_DEBUG=1 "$NR" "$WORK/need_missing" >"$WORK/adv.log" 2>&1; then
+    echo "nota: need_missing devuelve rc!=0 (el loader no resuelve la lib) — se evalua solo el aviso"
+fi
+grep -q "Falta la libreria glibc" "$WORK/adv.log" \
+    || fail "3: NRLD_DEBUG=1 deberia avisar [ADV] por NEEDED ausente"
+if NEONATOX_STRICT_SYSROOT=1 NRLD_DEBUG=1 "$NR" "$WORK/need_missing" >"$WORK/str.log" 2>&1; then
     fail "3: strict deberia fallar (exit 1) por NEEDED ausente"
 fi
-grep -q "Falta la libreria glibc" "$WORK/str.log" \
-    || fail "3: strict deberia reportar la libreria faltante"
-echo "ok 3: strict rc!=0 y default avisa ante NEEDED ausente"
+grep -q "Sysroot glibc incompleto" "$WORK/str.log" \
+    || fail "3: strict deberia reportar el sysroot incompleto"
+echo "ok 3: default silencioso; NRLD_DEBUG=1 avisa; strict rc!=0"
 
 # --- 4. LD_PRELOAD del proxy es transparente bajo musl (guard ABI)
 if ! LD_PRELOAD="$PROXY" /bin/true >/dev/null 2>&1; then
@@ -57,6 +64,26 @@ if ! LD_PRELOAD="$PROXY" /bin/sh -c 'exit 0' >/dev/null 2>&1; then
     fail "4: el proxy rompe un binario musl (/bin/sh)"
 fi
 echo "ok 4: proxy transparente bajo musl (/bin/true, /bin/sh)"
+
+# --- 5. canal: por defecto nrld NO escribe nada (ni stdout ni stderr).
+#     Regresion de Investigacion_05: las lineas [DEBUG]/[ADV] en stdout
+#     se convertian en argumentos de ld via command substitution.
+"$NR" "$WORK/need_vdpau" >"$WORK/ch.out" 2>"$WORK/ch.err"
+if [ -s "$WORK/ch.out" ]; then
+    fail "5: nrld por defecto debe dejar el stdout limpio del programa"
+fi
+if [ -s "$WORK/ch.err" ]; then
+    fail "5: nrld por defecto no debe escribir diagnostico a stderr"
+fi
+# con NRLD_DEBUG=3 el diagnostico va a stderr, NUNCA a stdout
+NRLD_DEBUG=3 "$NR" "$WORK/need_vdpau" >"$WORK/dbg.out" 2>"$WORK/dbg.err"
+if ! grep -q "Starting RLDispatcher" "$WORK/dbg.err"; then
+    fail "5: NRLD_DEBUG=3 deberia escribir el diagnostico a stderr"
+fi
+if grep -q "\[DEBUG\]\|\[ADV\]\|\[INFO\]" "$WORK/dbg.out"; then
+    fail "5: el diagnostico NUNCA debe ir a stdout"
+fi
+echo "ok 5: default silencioso; con NRLD_DEBUG=3 el log va a stderr"
 
 echo "TODOS LOS TESTS OK"
 exit 0

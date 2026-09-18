@@ -81,10 +81,61 @@ static int my_strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Log por niveles. Investigacion_05: nrld escribia TODO su           */
+/*  diagnostico a stdout, rompiendo protocolos que capturan stdout     */
+/*  (command substitution de make, lto-wrapper/collect2, pipes glibc): */
+/*  las lineas [DEBUG]/[ADV] acababan como argumentos de ld. Ahora el  */
+/*  diagnostico va SIEMPRE a stderr (fd 2), es SILENCIOSO por defecto  */
+/*  (nivel 0: solo [ERROR]) y se reactiva via NRLD_DEBUG=<0-3>,        */
+/*  log_level en /etc/nrld.conf o --verbose en modo manual.            */
+/* ------------------------------------------------------------------ */
+#define LOG_OFF   0   /* solo [ERROR]                    */
+#define LOG_WARN  1   /* + [ADV]                         */
+#define LOG_INFO  2   /* + [INFO]/[OK]                   */
+#define LOG_DEBUG 3   /* + [DEBUG] y lineas sin prefijo  */
+
+static int     g_log_level = LOG_OFF;
+static char    g_log_buf[1024];
+static unsigned g_log_len = 0;
+
+/* Nivel de una linea segun el prefijo. Las lineas sin prefijo
+   reconocible (fragmentos de datos) se tratan como debug: solo visibles
+   en el nivel mas alto, para que nunca contaminen por defecto. */
+static int log_level_for_line(const char *line, unsigned long len) {
+    if (len >= 7 && my_starts_with(line, "[ERROR]")) return LOG_OFF;
+    if (len >= 5 && my_starts_with(line, "[ADV]"))   return LOG_WARN;
+    if (len >= 6 && my_starts_with(line, "[INFO]"))  return LOG_INFO;
+    if (len >= 4 && my_starts_with(line, "[OK]"))    return LOG_INFO;
+    return LOG_DEBUG;
+}
+
+static void log_flush(void) {
+    if (!g_log_len) return;
+    int line_level = log_level_for_line(g_log_buf, g_log_len);
+    if (line_level == LOG_OFF || g_log_level >= line_level) {
+        syscall3(SYS_write, 2, (long)g_log_buf, g_log_len);
+    }
+    g_log_len = 0;
+}
+
+/* Diagnostico: stderr (fd 2), linea a linea, nivel derivado del prefijo
+   de cada linea. NUNCA escribe a stdout: ahi vive la salida del programa. */
 static void print_msg(const char *msg) {
+    unsigned long len = my_strlen(msg);
+    for (unsigned long i = 0; i < len; i++) {
+        if (g_log_len >= sizeof(g_log_buf) - 1) log_flush();
+        g_log_buf[g_log_len++] = msg[i];
+        if (msg[i] == '\n') log_flush();
+    }
+}
+
+/* Salida pedida por el usuario (--help): stdout (fd 1). */
+static void print_out(const char *msg) {
     syscall3(SYS_write, 1, (long)msg, my_strlen(msg));
 }
 
+/* Errores duros: SIEMPRE a stderr, sin importar el nivel de log. */
 static void print_err(const char *msg) {
     syscall3(SYS_write, 2, (long)msg, my_strlen(msg));
 }
@@ -642,6 +693,7 @@ static int check_needed_libs(const char *path, const char *bin_dir) {
 static char g_conf_libpath[4096];
 static char g_conf_proxy[256];
 static int  g_conf_strict = 0;
+static int  g_conf_log_level = 0;
 
 static int conf_token_is(const char *tok, long tlen, const char *word) {
     long wl = 0;
@@ -655,6 +707,7 @@ static void load_nrld_conf(void) {
     g_conf_libpath[0] = '\0';
     g_conf_proxy[0] = '\0';
     g_conf_strict = 0;
+    g_conf_log_level = 0;
     if (!file_exists(NRLCONF_PATH)) return;
     long fd = syscall2(SYS_open, (long)NRLCONF_PATH, 0);
     if (fd < 0) return;
@@ -692,6 +745,9 @@ static void load_nrld_conf(void) {
                    vlen > 0 && vlen < (long)sizeof(g_conf_proxy)) {
             for (long i = 0; i < vlen; i++) g_conf_proxy[i] = val[i];
             g_conf_proxy[vlen] = '\0';
+        } else if (conf_token_is(buf + start, klen, "log_level") &&
+                   vlen == 1 && val[0] >= '0' && val[0] <= '3') {
+            g_conf_log_level = val[0] - '0';
         }
     }
 }
@@ -1048,59 +1104,66 @@ static void wait_parent_dead(void) {
 }
 
 static void print_usage_help(void) {
-    print_msg("NeonatoX RLDispatcher (nrld) -- fake glibc linker para hosts musl\n");
-    print_msg("\n");
-    print_msg("Aisla binarios glibc de las librerias musl de /usr/lib, ejecutandolos\n");
-    print_msg("con un glibc real y autosuficiente dentro de /usr/lib/glibc6 (sysroot).\n");
-    print_msg("\n");
-    print_msg("Uso:\n");
-    print_msg("  nrld --help                        Muestra esta ayuda (modo verboso)\n");
-    print_msg("  nrld BIN [ARGOS...]                Ejecuta BIN glibc sobre el sysroot\n");
-    print_msg("  (instalado como /lib64/ld-linux-x86-64.so.2: los binarios con ese\n");
-    print_msg("   PT_INTERP se ejecutan solos con ./BIN, sin invocar nrld a mano)\n");
-    print_msg("\n");
-    print_msg("Que hace con BIN:\n");
-    print_msg("  1. Detecta el binario real (AT_EXECFN o argv[1]) y exige que sea ELF.\n");
-    print_msg("  2. AppImage type-2: extrae el squashfs a /tmp/nrld-appimage-<pid>/\n");
-    print_msg("     (sin FUSE, nunca escribe fuera de /tmp) y usa el binario interno\n");
-    print_msg("     mas sus dirs de librerias internas (lib/, usr/lib/<triplet>, ...).\n");
-    print_msg("  3. Guard transitivo de DT_NEEDED: verifica que cada libreria necesitada\n");
-    print_msg("     (y las de sus dependencias) resuelve dentro del sysroot glibc.\n");
-    print_msg("  4. Extralibfinder: si un soname falta en los dirs estandar, lo busca\n");
-    print_msg("     en subdirectorios no estandar del sysroot (gvfs/, pulseaudio/, ...)\n");
-    print_msg("     y anade ese dir a LD_LIBRARY_PATH / --library-path.\n");
-    print_msg("  5. Corrige DT_NEEDED absolutos creando copias parcheadas en\n");
-    print_msg("     /tmp/nrld-patch-<pid>/ (traducidos a soname resoluble por --library-path).\n");
-    print_msg("  6. Executa una copia parcheada (<base>-nrld-<pid>) de BIN en su\n");
-    print_msg("     propio directorio cuyo PT_INTERP apunta al loader glibc real (cargado\n");
-    print_msg("     in-process por el kernel): /proc/self/exe queda en el dir de la app,\n");
-    print_msg("     los hijos que re-ejecutan su propio binario funcionan. LD_PRELOAD con\n");
-    print_msg("     el proxy libnrld-proxy.so (scan strict de dlopen).\n");
-    print_msg("\n");
-    print_msg("Configuracion (/etc/nrld.conf, lo escribe el instalador; key = value):\n");
-    print_msg("  library_path = <dirs>      LD_LIBRARY_PATH (default: dirs del sysroot)\n");
-    print_msg("  proxy        = <ruta>      LD_PRELOAD (default: NEO_BINDIR/libnrld-proxy.so)\n");
-    print_msg("  strict                      modo estricto global (sin env)\n");
-    print_msg("\n");
-    print_msg("Modo estricto del sysroot (aislacion musl<->glibc):\n");
-    print_msg("  NEONATOX_STRICT_SYSROOT=1 ./BIN    falla limpio si falta algo\n");
-    print_msg("  echo strict > /etc/nrld.conf       hace estricto todo (sin env)\n");
-    print_msg("  (evita la mezcla de dos libcs en un proceso -> el SIGSEGV de strtod_l)\n");
-    print_msg("\n");
-    print_msg("Variables de entorno que nrld importa/exporta:\n");
-    print_msg("  NEONATOX_STRICT_SYSROOT   strict por env (0/1)\n");
-    print_msg("  NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)\n");
-    print_msg("  NEONATOX_SYSROOT          root del sysroot (la lee el proxy)\n");
-    print_msg("  NEONATOX_APPDIR           raiz extraida de un AppImage\n");
-    print_msg("  NEONATOX_DUMPENV          dump del entorno del hijo a /tmp (debug)\n");
-    print_msg("  QT_PLUGIN_PATH            dir del plugin de plataforma Qt (si aplica)\n");
-    print_msg("\n");
-    print_msg("Salida (modo verboso por defecto):\n");
-    print_msg("  [DEBUG] razonamiento interno      [ADV] avisos (faltantes/extraccion)\n");
-    print_msg("  [INFO]  cambios de config         [OK]  todas las NEEDED en el sysroot\n");
-    print_msg("  [ERROR] fallo (solo en strict)    [neonatox] mensajes del proxy\n");
-    print_msg("\n");
-    print_msg("Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.\n");
+    print_out("NeonatoX RLDispatcher (nrld) -- fake glibc linker para hosts musl\n");
+    print_out("\n");
+    print_out("Aisla binarios glibc de las librerias musl de /usr/lib, ejecutandolos\n");
+    print_out("con un glibc real y autosuficiente dentro de /usr/lib/glibc6 (sysroot).\n");
+    print_out("\n");
+    print_out("Uso:\n");
+    print_out("  nrld --help                        Muestra esta ayuda\n");
+    print_out("  nrld BIN [ARGOS...]                Ejecuta BIN glibc sobre el sysroot\n");
+    print_out("  nrld [--verbose|--quiet] BIN ...   Ajusta el log de la ejecucion\n");
+    print_out("  (instalado como /lib64/ld-linux-x86-64.so.2: los binarios con ese\n");
+    print_out("   PT_INTERP se ejecutan solos con ./BIN, sin invocar nrld a mano)\n");
+    print_out("\n");
+    print_out("Que hace con BIN:\n");
+    print_out("  1. Detecta el binario real (AT_EXECFN o argv[1]) y exige que sea ELF.\n");
+    print_out("  2. AppImage type-2: extrae el squashfs a /tmp/nrld-appimage-<pid>/\n");
+    print_out("     (sin FUSE, nunca escribe fuera de /tmp) y usa el binario interno\n");
+    print_out("     mas sus dirs de librerias internas (lib/, usr/lib/<triplet>, ...).\n");
+    print_out("  3. Guard transitivo de DT_NEEDED: verifica que cada libreria necesitada\n");
+    print_out("     (y las de sus dependencias) resuelve dentro del sysroot glibc.\n");
+    print_out("  4. Extralibfinder: si un soname falta en los dirs estandar, lo busca\n");
+    print_out("     en subdirectorios no estandar del sysroot (gvfs/, pulseaudio/, ...)\n");
+    print_out("     y anade ese dir a LD_LIBRARY_PATH / --library-path.\n");
+    print_out("  5. Corrige DT_NEEDED absolutos creando copias parcheadas en\n");
+    print_out("     /tmp/nrld-patch-<pid>/ (traducidos a soname resoluble por --library-path).\n");
+    print_out("  6. Executa una copia parcheada (<base>-nrld-<pid>) de BIN en su\n");
+    print_out("     propio directorio cuyo PT_INTERP apunta al loader glibc real (cargado\n");
+    print_out("     in-process por el kernel): /proc/self/exe queda en el dir de la app,\n");
+    print_out("     los hijos que re-ejecutan su propio binario funcionan. LD_PRELOAD con\n");
+    print_out("     el proxy libnrld-proxy.so (scan strict de dlopen).\n");
+    print_out("\n");
+    print_out("Configuracion (/etc/nrld.conf, lo escribe el instalador; key = value):\n");
+    print_out("  library_path = <dirs>      LD_LIBRARY_PATH (default: dirs del sysroot)\n");
+    print_out("  proxy        = <ruta>      LD_PRELOAD (default: NEO_BINDIR/libnrld-proxy.so)\n");
+    print_out("  strict                      modo estricto global (sin env)\n");
+    print_out("  log_level    = <0-3>       nivel de log global (ver 'Salida')\n");
+    print_out("\n");
+    print_out("Modo estricto del sysroot (aislacion musl<->glibc):\n");
+    print_out("  NEONATOX_STRICT_SYSROOT=1 ./BIN    falla limpio si falta algo\n");
+    print_out("  echo strict > /etc/nrld.conf       hace estricto todo (sin env)\n");
+    print_out("  (evita la mezcla de dos libcs en un proceso -> el SIGSEGV de strtod_l)\n");
+    print_out("\n");
+    print_out("Variables de entorno que nrld importa/exporta:\n");
+    print_out("  NRLD_DEBUG=<0-3>           log de ESTE proceso (0=off,1=warn,2=info,3=debug)\n");
+    print_out("  NEONATOX_STRICT_SYSROOT   strict por env (0/1)\n");
+    print_out("  NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)\n");
+    print_out("  NEONATOX_SYSROOT          root del sysroot (la lee el proxy)\n");
+    print_out("  NEONATOX_APPDIR           raiz extraida de un AppImage\n");
+    print_out("  NEONATOX_DUMPENV          dump del entorno del hijo a /tmp (debug)\n");
+    print_out("  QT_PLUGIN_PATH            dir del plugin de plataforma Qt (si aplica)\n");
+    print_out("\n");
+    print_out("Salida (SILENCIO por defecto; diagnostico SOLO a stderr):\n");
+    print_out("  nrld NO escribe a stdout: ahi vive la salida real del programa. Un\n");
+    print_out("  loader real (ld.so) nunca escribe a stdout; re-escribirlo ahi rompia\n");
+    print_out("  make $(shell ...), lto-wrapper/collect2 y los pipes glibc.\n");
+    print_out("  Nivel 0: solo [ERROR] (default)   Nivel 1: + [ADV] avisos\n");
+    print_out("  Nivel 2: + [INFO]/[OK]            Nivel 3: + [DEBUG] razonamiento\n");
+    print_out("  Reactiva el log con NRLD_DEBUG=3 ./BIN, 'nrld --verbose BIN',\n");
+    print_out("  o log_level = 3 en /etc/nrld.conf (global). --help si imprime (stdout).\n");
+    print_out("\n");
+    print_out("Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.\n");
 }
 
 void _start_main(long *sp) {
@@ -1108,18 +1171,20 @@ void _start_main(long *sp) {
     char **argv = (char **)&sp[1];
     char **envp = &argv[argc + 1];
 
-    /* El Parent de Firefox avisa con el PID de cada hijo que muere; poner el
-       pid aqui permite correlacionar los warnings con la instancia de nrld. */
-    char pidb[16];
-    uint_to_str(syscall0(SYS_getpid), pidb, sizeof(pidb));
-    print_msg("[DEBUG] Starting RLDispatcher (pid ");
-    print_msg(pidb);
-    print_msg(")\n");
-
     /* Cargar /etc/nrld.conf (host): strict global + overrides library_path/
-       proxy escritos por el instalador. Los defaults (NEO_SYSROOT dirs /
-       NEO_BINDIR proxy) aplican si el archivo no existe. */
+       proxy + log_level escritos por el instalador. Los defaults
+       (NEO_SYSROOT dirs / NEO_BINDIR proxy) aplican si el archivo no
+       existe. El nivel de log se fija ANTES de cualquier diagnostico:
+       por defecto nrld es SILENCIOSO (nivel 0, solo [ERROR]). */
     load_nrld_conf();
+    g_log_level = g_conf_log_level;
+    for (char **e = envp; *e; e++) {
+        if (my_starts_with(*e, "NRLD_DEBUG=")) {
+            char lv = (*e)[11];
+            if (lv >= '0' && lv <= '3') g_log_level = lv - '0';
+            break;
+        }
+    }
 
     char **envp_end = envp;
     while (*envp_end) envp_end++;
@@ -1149,23 +1214,67 @@ void _start_main(long *sp) {
         for (const char *p = execfn; *p; p++) if (*p == '/') b = p + 1;
         nrld_launched = my_starts_with(b, "nrld");
     }
-    int manual = (argc >= 2 && argv[1][0] != '-' && nrld_launched);
-    if (nrld_launched && argc >= 2 &&
-        (my_strcmp(argv[1], "--help") == 0 || my_strcmp(argv[1], "-h") == 0)) {
-        print_usage_help();
-        syscall1(SYS_exit, 0);
-        return;
+    /* Flags solo cuando nrld fue invocado directamente (nunca como PT_INTERP,
+       para no robarle flags a la app): --help, --verbose/-v (log al maximo),
+       --quiet/-q (solo [ERROR]), antes de un BIN opcional. */
+    int opt_idx = 1;
+    if (nrld_launched) {
+        while (opt_idx < argc && argv[opt_idx][0] == '-' &&
+               argv[opt_idx][1] != '\0') {
+            if (my_strcmp(argv[opt_idx], "--help") == 0 ||
+                my_strcmp(argv[opt_idx], "-h") == 0) {
+                print_usage_help();
+                syscall1(SYS_exit, 0);
+                return;
+            }
+            if (my_strcmp(argv[opt_idx], "--verbose") == 0 ||
+                my_strcmp(argv[opt_idx], "-v") == 0) {
+                g_log_level = LOG_DEBUG;
+                opt_idx++;
+                continue;
+            }
+            if (my_strcmp(argv[opt_idx], "--quiet") == 0 ||
+                my_strcmp(argv[opt_idx], "-q") == 0) {
+                g_log_level = LOG_OFF;
+                opt_idx++;
+                continue;
+            }
+            break;
+        }
+        if (opt_idx >= argc) {
+            print_usage_help();
+            syscall1(SYS_exit, 0);
+            return;
+        }
     }
+    int manual = (opt_idx < argc && argv[opt_idx][0] != '-' && nrld_launched);
+
+    /* El Parent de Firefox avisa con el PID de cada hijo que muere; poner el
+       pid aqui permite correlacionar los warnings con la instancia de nrld. */
+    {
+        char pidb[16];
+        uint_to_str(syscall0(SYS_getpid), pidb, sizeof(pidb));
+        print_msg("[DEBUG] Starting RLDispatcher (pid ");
+        print_msg(pidb);
+        print_msg(")\n");
+    }
+
     if (manual) {
-        target_bin = argv[1];
-        orig_args_start = 2;
-        print_msg("[DEBUG] Manual mode (argv[1] es path)\n");
+        target_bin = argv[opt_idx];
+        orig_args_start = opt_idx + 1;
+        print_msg("[DEBUG] Manual mode (argv[");
+        {
+            char db[16];
+            uint_to_str(opt_idx, db, sizeof(db));
+            print_msg(db);
+        }
+        print_msg("] es path)\n");
     } else if (execfn) {
         target_bin = execfn;
         orig_args_start = 1;
         print_msg("[DEBUG] Direct mode (using AT_EXECFN)\n");
     } else {
-        print_err("[DEBUG] ERROR: No se pudo determinar el binario\n");
+        print_err("[ERROR] No se pudo determinar el binario\n");
         syscall1(SYS_exit, 1);
         return;
     }
@@ -1176,7 +1285,7 @@ void _start_main(long *sp) {
 
     char target_bin_abs[4096];
     if (!resolve_path(target_bin, target_bin_abs, sizeof(target_bin_abs))) {
-        print_err("[DEBUG] ERROR: No se pudo resolver ruta\n");
+        print_err("[ERROR] No se pudo resolver ruta\n");
         syscall1(SYS_exit, 1);
         return;
     }
@@ -1213,7 +1322,7 @@ void _start_main(long *sp) {
     print_msg("\n");
 
     if (!file_exists(target_bin_abs)) {
-        print_err("[DEBUG] ERROR: Binario no existe: ");
+        print_err("[ERROR] Binario no existe: ");
         print_err(target_bin_abs);
         print_err("\n");
         syscall1(SYS_exit, 1);
@@ -1327,7 +1436,7 @@ void _start_main(long *sp) {
         sargv[s_argc + 1] = (char *)0;
         long sret = syscall3(SYS_execve, (long)sargv[0], (long)sargv, (long)script_envp);
         (void)sret;
-        print_err("[DEBUG] ERROR: execve del AppRun script falló\n");
+        print_err("[ERROR] execve del AppRun script falló\n");
         syscall1(SYS_exit, 1);
         return;
     }
@@ -1488,7 +1597,7 @@ void _start_main(long *sp) {
         long pid = syscall1(SYS_fork, 0);
 
         if (pid < 0) {
-            print_err("[DEBUG] ERROR: fork falló\n");
+            print_err("[ERROR] fork falló\n");
             syscall1(SYS_exit, 1);
             return;
         }
@@ -1496,12 +1605,12 @@ void _start_main(long *sp) {
         if (pid == 0) {
             syscall2(SYS_unlink, (long)INTERP_TMP, 0);
             if (syscall2(SYS_symlink, (long)REAL_LOADER, (long)INTERP_TMP) < 0) {
-                print_err("[DEBUG] HIJO ERROR: symlink falló\n");
+                print_err("[ERROR] HIJO: symlink falló\n");
                 syscall1(SYS_exit, 1);
                 return;
             }
             if (syscall2(SYS_rename, (long)INTERP_TMP, (long)INTERP_PATH) < 0) {
-                print_err("[DEBUG] HIJO ERROR: rename falló\n");
+                print_err("[ERROR] HIJO: rename falló\n");
                 syscall1(SYS_exit, 1);
                 return;
             }
@@ -1519,7 +1628,7 @@ void _start_main(long *sp) {
 
             syscall3(SYS_execve, (long)bin_argv[0], (long)bin_argv, (long)new_envp);
             
-            print_err("[DEBUG] HIJO ERROR: execve falló\n");
+            print_err("[ERROR] HIJO: execve falló\n");
             syscall2(SYS_unlink, (long)INTERP_TMP, 0);
             syscall2(SYS_symlink, (long)FAKE_LOADER, (long)INTERP_TMP);
             syscall2(SYS_rename, (long)INTERP_TMP, (long)INTERP_PATH);
@@ -1568,7 +1677,7 @@ void _start_main(long *sp) {
         long ret = syscall3(SYS_execve, (long)interp_run, (long)bin_argv, (long)new_envp);
         if (ret >= 0) return;
 
-        print_err("[DEBUG] ERROR: execve de la copia falló; reintento con el loader real\n");
+        print_err("[ERROR] execve de la copia falló; reintento con el loader real\n");
         syscall1(SYS_unlink, (long)interp_run);
     } else {
         print_msg("[DEBUG] No se pudo crear la copia (dir no escribible?); loader como principal\n");
@@ -1596,7 +1705,7 @@ void _start_main(long *sp) {
 
     long ret = syscall3(SYS_execve, (long)loader_argv[0], (long)loader_argv, (long)new_envp);
 
-    print_err("[DEBUG] ERROR: execve falló con código ");
+    print_err("[ERROR] execve falló con código ");
     char err_buf[32];
     int err_len = 0;
     temp = -ret;

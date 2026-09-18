@@ -54,6 +54,19 @@ Two components working together:
 
 ## Known behavior
 
+**Logging (fix de Investigacion_05):** nrld writes its diagnostics to **stderr only**, never
+stdout, and is **silent by default** (level 0, only hard `[ERROR]`). The old behavior spammed
+stdout with `[DEBUG]`/`[ADV]` lines, which broke make `$(shell ...)`, `lto-wrapper`/`collect2`
+and glibc pipe protocols (nrld lines tokenized into `ld` args). Levels:
+`0=off(only [ERROR])`, `1=+[ADV]`, `2=+[INFO]/[OK]`, `3=+[DEBUG]`. Gating is per-line by the
+prefix, buffered in `print_msg` (freestanding, line-buffered to fd 2); `print_out` is stdout
+for `--help` only; `print_err` is fd 2 always. Set per-process with `NRLD_DEBUG=<0-3>` (env),
+globally with `log_level = <0-3>` in `/etc/nrld.conf`, or with `--verbose`/`--quiet` when nrld
+is invoked directly. In user mode the interp-patched copy already prevents nrld re-entry on
+children re-exec (real loader interp), so the report's make/lto-wrapper failure no longer
+occurs even in the loader-as-main fallback — diagnostics just don't pollute the parent's
+captured stdout.
+
 `nrld` must NOT try to load non-ELF files, or it recursively intercepts processes that exec non-binaries (e.g. Firefox launching a crash handler over a `.dmp` file, which segfaults with "invalid ELF header"). Early-exit guard: `is_elf()` check after `file_exists()` in `nrld.c` — non-ELF files cause an immediate clean `exit(0)`.
 
 **AppImage / type-2 ELFs (`EI_ABIVERSION`):** AppImage-style ELFs carry a non-zero `EI_ABIVERSION` (byte 8 of `e_ident`, e.g. `0x41`/"AI"), which the glibc loader **rejects outright** with "ELF file ABI version invalid" — before any NEEDED/lib logic. `maybe_patch_abi_version()` (in `nrld.c`) detects a non-zero byte 8 after the `is_elf` check and creates a **patched copy** in `/tmp/nrld-<pid>/` with that byte zeroed, then execs the copy instead of the original. Original path is untouched and kept for `NEONATOX_REAL_EXE` (dlopen allowlist). Verified: ABI-65 ELF → patched copy `ABIVERSION=0` exec'd; normal ELFs are run as-is (no patch).
