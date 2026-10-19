@@ -88,6 +88,8 @@ Variables de entorno que nrld importa/exporta:
   NRLD_DEBUG=<0-3>           log de ESTE proceso (0=off,1=warn,2=info,3=debug)
   NEONATOX_STRICT_SYSROOT   strict por env (0/1)
   NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)
+  NEONATOX_PROXY            ruta del proxy a inyectar (test/avanzado; la
+                            usa nrld en vez de NEO_BINDIR/libnrld-proxy.so)
   NEONATOX_SYSROOT          root del sysroot (la lee el proxy)
   NEONATOX_APPDIR           raiz extraida de un AppImage
   NEONATOX_DUMPENV          dump del entorno del hijo a /tmp (debug)
@@ -157,6 +159,7 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 | `derive_allow_dir`, `is_allowed_path` | Dirs permitidos: `/usr/lib/glibc6/*` (`under_sysroot`, root desde `NEONATOX_SYSROOT`), `NEO_BINDIR` (el proxy/librarys propias), el dir del exe real, `NEONATOX_APPDIR` y el propio loader glibc del rtld. |
 | `redirect_to_sysroot` | Reencamina `dlopen("/usr/lib/...")` a la copia glibc del sysroot si existe (mismo path relativo). |
 | `dlopen`/`dlmopen` interposición | Solo strict: tras cada `dlopen` escanea **todo el link-map** (`dl_iterate_phdr`); si algo resuelve fuera del sysroot (musl) → `dlclose` + `NULL` + mensaje `[neonatox] Falta la libreria...`. Cubre árboles cargados en runtime (el `libxul` de Firefox). |
+| **Scrub de env en exec (hijos musl)** | Interpone `execve`/`execv`/`execvp`/`execvpe`/`fexecve`/`posix_spawn`/`posix_spawnp`: si el **destino es musl** (ELF con interp `ld-musl-*` o shebang `#!` cuyo intérprete sea musl), retira `LD_LIBRARY_PATH` y `LD_PRELOAD` del `envp` antes de delegar (el destino real — resuelto por PATH si es nombre sin `/` — se inspecciona con `open`+`pread` sin crear FDs residuales). Fix del crash GTK/OpenCode (app glibc → `bwrap`/glycin musl heredaba `LD_LIBRARY_PATH` glibc → `Error relocating libcap.so.2: __isoc23_strtoul` → exit 127). **Seguro en ambos sentidos**: los hijos glibc conservan el env (re-entran a nrld por interp, que re-inyecta `LD_*`) y los musl no se contaminan. *Gap documentado:* `execl*` y `execveat` no están interpuestos (la app debe exportar un `envp`; `execl*` construye el envp interno — resolvería igual vía libc, pero no se filtra). Ver sección *Scrub de LD\_\* en exec*. |
 | Verdict cache | Una ruta permitida queda permitida para todo el proceso → Chromium (cientos de `dlopen`) no paga un walk completo por cada uno. |
 | Crash diagnostics (`NEONATOX_CRASHDUMP=1`) | Handlers SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE: dump del módulo+offset (vía `/proc/self/maps`) y de librerías musl mapeadas. |
 | `NEONATOX_PROXY_LOG` / `NEONATOX_DUMPENV` | Espejo a archivo de los mensajes `[neonatox]` (no a stderr, para no ensuciar) y dump del entorno a `/tmp/neonatox-env-<pid>.txt`. |
@@ -236,6 +239,58 @@ sudo install -o root -m644 nrld.conf /etc/nrld.conf   # ajustar librerías si no
 sudo install -o root -m644 nrld-profile.sh /etc/profile.d/nrld-profile.sh
 ```
 
+---
+
+## Scrub de LD\_\* en exec: los hijos musl no heredan el env glibc
+
+**El crash (raíz verificada):** una app glibc bajo nrld tiene
+`LD_LIBRARY_PATH=.:/usr/lib/glibc6/usr/lib:/usr/lib/glibc6/lib` + `LD_PRELOAD=<proxy>`
+en su entorno (necesarios para su loader in-process). Si esa app spawna un binario
+**musl** (el `bwrap` de los sandboxes glycin, un shell, `git`, ...) pasándole su
+`envp` tal cual, el loader musl del hijo busca `libcap.so.2`/`libreadline`/... en
+los dirs glibc → `Error relocating ... __isoc23_strtoul: symbol not found` →
+exit 127 → la app muere con una aserción GTK (`Gtk:ERROR ... ensure_surface_for_gicon`
+en OpenCode) o con "process exited with status 1" a medias. Fue también el
+mecanismo del `git` roto.
+
+**El fix (en `libnrld-proxy.so`, sección "Scrub de env en exec"):** el proxy
+interpone las familias `execve*` y `posix_spawn*`. Antes de delegar al `execve`
+real, decide si el **destino es musl**:
+
+- ELF con `PT_INTERP` `ld-musl-*` (se inspecciona con `open`+`pread` del destino:
+  ruta absoluta, o resuelta vía `PATH` cuando argv[0] no tiene `/`);
+- o `#!` cuyo intérprete sea musl (un nivel).
+
+Si el destino es musl → copia el `envp` **sin** `LD_LIBRARY_PATH` ni `LD_PRELOAD`
+(solo esas dos; el resto — incluido lo que la app quiera pasar — queda intacto).
+Si es glibc (o no se pudo determinar) → `envp` original sin tocar.
+
+**Por qué es seguro en ambos sentidos:** los hijos **glibc** re-entran a nrld por
+su `PT_INTERP` (copia parcheada con interp real o interp del sistema) y nrld
+**re-inyecta** `LD_LIBRARY_PATH`/`LD_PRELOAD` según su config → el scrub no les
+quita nada efectivo. Los hijos **musl** reciben su env limpio → nunca mezclan
+libcs. El `LD_PRELOAD` del proxy tampoco se carga ya en musl (guard ABI de
+`init_proxy`), y con el scrub ni siquiera llega a intentarse.
+
+**Gap documentado:** `execl`/`execlp`/`execle` y `execveat` **no** están
+interpuestos (glibc los rutas todos por `execve` internamente, pero el `envp`
+que construyen es interno al wrapper: nuestra interposición no los ve pasar;
+`execveat` no tiene wrapper libc estándar). Una app que spawnee musl vía `execl*`
+seguiría filtrando el env — la mitigación práctica es que las apps en este
+ecosistema usan `execve`/`posix_spawn` (GLib/Rust lo hacen).
+
+**Corridas de prueba (E2E):** `test/run_tests.sh` casos 6 y 7 — probes ELF
+generados por `test/gen_probes.py` (payload que llama `execve` vía PLT real,
+no `syscall` crudo, para que la interposición **se ejerza**):
+
+- caso 6: hijo musl (`/bin/sh`) arranca limpio: salida exacta `L= P= FOO=bar`
+  (sin `LD_*` glibc, la variable propia sobrevive);
+- caso 7: hijo glibc (`env_dump`) conserva el env completo (`FOO=bar`).
+
+Los tests apuntan al proxy del build con `NEONATOX_PROXY=<ruta>` (override que
+nrld importa para su `LD_PRELOAD`: env > conf > default), así se valida el binario
+fresco sin `sudo meson install`.
+
 ## Uso
 
 `nrld` es el interp del sistema (`/lib64/ld-linux-x86-64.so.2` → nrld), así que el kernel lo
@@ -294,6 +349,14 @@ los binarios musl del host (ver `test/run_tests.sh`, caso 4).
   viejas** (solo se conserva la que aún es `/proc/self/exe` de un proceso vivo, p. ej. una
   instancia concurrente). Sobrevive a lo sumo una copia obsoleta por `<base>`, limpiada por
   la siguiente ejecución.
+- **Scrub de `LD_*` en exec hacia hijos musl (fix crash GTK de OpenCode)**: la app
+  `ai.opencode.desktop` spawneaba `bwrap` (glycin) con su `envp` glibc heredado →
+  `Error relocating libcap.so.2: __isoc23_strtoul` → exit 127 → `Gtk:ERROR` (abort).
+  Resuelto interponiendo `execve*`/`posix_spawn*` en el proxy (retira
+  `LD_LIBRARY_PATH`/`LD_PRELOAD` solo si el destino es musl; shebang `#!` musl cuenta).
+  Verificado live: sin proxy / con el proxy viejo instalado el `bwrap` revienta con
+  `libcap.so.2: __isoc23_strtoul`; con el proxy fresco del build, `bwrap` corre
+  (usage normal). E2E: tests 6/7 de `test/run_tests.sh` (7/7 OK).
 - **Refactor build/config/host (`main` actual)**: sysroot `/usr/lib/glibc6` como default
   compile-time (`NEO_SYSROOT`, no runtime); binarios y config en el **host**
   (`/usr/lib/neonatox/`, `/etc/nrld.conf`, `/etc/profile.d/nrld-profile.sh`) fuera del

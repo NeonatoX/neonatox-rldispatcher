@@ -85,5 +85,25 @@ if grep -q "\[DEBUG\]\|\[ADV\]\|\[INFO\]" "$WORK/dbg.out"; then
 fi
 echo "ok 5: default silencioso; con NRLD_DEBUG=3 el log va a stderr"
 
+# --- 6. scrub musl: un hijo musl NO hereda LD_LIBRARY_PATH/LD_PRELOAD
+#     glibc. Regresion del crash real glycin/bwrap (GTK->libglycin->bwrap
+#     musl heredaba el LD_LIBRARY_PATH del sysroot -> "Error relocating
+#     libcap.so.2: __isoc23_strtoul" -> exit 127 -> Gtk:ERROR -> abort).
+#     exec_scrub (glibc) execve'a /bin/sh (musl) con esos LD_* en su envp:
+#     el proxy del build (NEONATOX_PROXY) debe scrubearlos antes del exec.
+NEONATOX_PROXY="$PROXY" "$NR" "$WORK/exec_scrub" >"$WORK/scrub.out" 2>"$WORK/scrub.err"
+if [ "$(cat "$WORK/scrub.out")" != "L= P= FOO=bar" ]; then
+    fail "6: el hijo musl heredo LD_* glibc: '$(cat "$WORK/scrub.out")'"
+fi
+echo "ok 6: hijo musl ejecuta limpio (sin LD_LIBRARY_PATH/LD_PRELOAD glibc)"
+
+# --- 7. keep glibc (control): los hijos GLIBC conservan el env intacto
+#     (exec_keep ejecuta env_dump con el envp heredado; FOO=bar debe
+#     sobrevivir al paso por el execve interpuesto del proxy).
+FOO=bar NEONATOX_PROXY="$PROXY" "$NR" "$WORK/exec_keep" "$WORK/env_dump" >"$WORK/keep.out" 2>&1
+grep -q '^FOO=bar$' "$WORK/keep.out" \
+    || fail "7: el hijo glibc deberia conservar FOO=bar (env passthrough)"
+echo "ok 7: hijo glibc conserva el env (FOO=bar)"
+
 echo "TODOS LOS TESTS OK"
 exit 0

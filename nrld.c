@@ -1150,6 +1150,7 @@ static void print_usage_help(void) {
     print_out("  NEONATOX_STRICT_SYSROOT   strict por env (0/1)\n");
     print_out("  NEONATOX_REAL_EXE         ruta real del binario (la lee el proxy)\n");
     print_out("  NEONATOX_SYSROOT          root del sysroot (la lee el proxy)\n");
+    print_out("  NEONATOX_PROXY            ruta del proxy a inyectar (test/avanzado)\n");
     print_out("  NEONATOX_APPDIR           raiz extraida de un AppImage\n");
     print_out("  NEONATOX_DUMPENV          dump del entorno del hijo a /tmp (debug)\n");
     print_out("  QT_PLUGIN_PATH            dir del plugin de plataforma Qt (si aplica)\n");
@@ -1537,8 +1538,21 @@ void _start_main(long *sp) {
         }
     }
 
+    /* Override de LD_PRELOAD: NEONATOX_PROXY=<ruta> (simetrico a
+       NEONATOX_SYSROOT que ya honra el proxy). Prioridad: env > conf >
+       default NEO_BINDIR. Ademas de utilidad general (probar un proxy
+       distinto sin reinstalar), es lo que usa el E2E para ejercitar el
+       proxy recien compilado del build/ sin tocar la instalacion. */
+    const char *env_proxy = 0;
+    for (char **e = envp; *e; e++) {
+        if (my_starts_with(*e, "NEONATOX_PROXY=")) { env_proxy = *e + 15; break; }
+    }
     my_strcpy(g_ld_preload, "LD_PRELOAD=");
-    my_strcat(g_ld_preload, g_conf_proxy[0] ? g_conf_proxy : PROXY_LIB);
+    if (env_proxy && *env_proxy) {
+        my_strcat(g_ld_preload, env_proxy);
+    } else {
+        my_strcat(g_ld_preload, g_conf_proxy[0] ? g_conf_proxy : PROXY_LIB);
+    }
 
     char *new_envp[clean_count + 10];
     int env_idx = 0;

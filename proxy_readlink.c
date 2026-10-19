@@ -10,6 +10,8 @@
 #include <ucontext.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <errno.h>
+#include <spawn.h>
 
 /* Compile-time defaults (same knobs as nrld; Meson passes -D...). Overridable
    at runtime via NEONATOX_SYSROOT for the sysroot root. */
@@ -621,5 +623,315 @@ void *dlmopen(Lmid_t lmid, const char *filename, int flag) {
     void *h = real_dlmopen ? real_dlmopen(lmid, use, flag) : NULL;
     if (!h) return h;
     return verify_dlopen_handle(h, use);
+}
+
+/* ------------------------------------------------------------------ */
+/*  exec interposition: saneo de LD_* para hijos musl.                 */
+/*                                                                      */
+/*  Una app glibc bajo nrld corre con LD_LIBRARY_PATH apuntando al      */
+/*  sysroot glibc (hace falta para su propio loader). Si esa app espawnea*/
+/*  un binario MUSL (bwrap de glycin, git, helpers de la distro...), el */
+/*  hijo musl hereda ese LD_LIBRARY_PATH y su loader busca las libs AHÍ:*/
+/*  encuentra los builds de glibc del sysroot y muere con               */
+/*  "Error relocating ... symbol not found" -> exit 127. Ese fue el     */
+/*  crash real de OpenCode/GTK: GTK pide un icono SVG -> libglycin      */
+/*  lanza el loader dentro de bwrap (musl) -> bwrap revienta al cargar  */
+/*  libcap.so.2 de glibc -> Gtk:ERROR -> abort.                         */
+/*                                                                      */
+/*  Fix: al hacer exec de un target cuyo PT_INTERP es musl (ld-musl-*), */
+/*  pasar un envp SIN LD_LIBRARY_PATH ni LD_PRELOAD. Es seguro en ambas */
+/*  direcciones: los hijos GLIBC conservan el env intacto (ademas su    */
+/*  interp vuelve a entrar a nrld, que re-inyecta LD_*), y los musl     */
+/*  quedan limpios. El propio proxy no aporta nada en procesos musl     */
+/*  (toda su interposicion esta gated a glibc: guard g_glibc_host).      */
+/*                                                                      */
+/*  GAP conocido: execl/execlp/execle no se interponen (varargs). Los   */
+/*  spawners reales (Rust std, glib g_spawn, Chromium, shells, system())*/
+/*  usan execve/posix_spawn[sp], que si estan cubiertos. execveat()     */
+/*  (syscall directo) evade toda interposicion por naturaleza.          */
+/* ------------------------------------------------------------------ */
+
+static int starts_with(const char *s, const char *p) {
+    while (*p) { if (*s++ != *p++) return 0; }
+    return 1;
+}
+
+static unsigned el16(const unsigned char *p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+static unsigned el32(const unsigned char *p) {
+    unsigned v = 0;
+    for (int i = 3; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+static unsigned long long el64(const unsigned char *p) {
+    unsigned long long v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+/* 1 si la region [hay,hay+hn) contiene la subcadena needle. */
+static int mem_find(const char *hay, size_t hn, const char *needle, size_t nn) {
+    if (nn > hn) return 0;
+    for (size_t i = 0; i + nn <= hn; i++)
+        if (memcmp(hay + i, needle, nn) == 0) return 1;
+    return 0;
+}
+
+/* PT_INTERP de un ELF ya abierto: 1 si es el loader musl (ld-musl-*).
+   Soporta ELF32 y ELF64 (host x86-64; los probes Wine 32-bit tambien).
+   No cierra el fd (el caller es dueño). Cualquier lectura rara -> 0
+   (passthrough: mejor no tocar el env que romper un exec valido). */
+static int fd_interp_musl(int fd) {
+    unsigned char eh[64];
+    if (pread(fd, eh, 64, 0) != 64) return 0;
+    if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F') return 0;
+    int is64 = (eh[4] == 2);
+    unsigned long long phoff;
+    unsigned phentsize, phnum;
+    if (is64) {
+        phoff = el64(eh + 0x20);
+        phentsize = el16(eh + 0x36);
+        phnum = el16(eh + 0x38);
+        if (phentsize < 56) return 0;
+    } else {
+        phoff = el32(eh + 0x1c);
+        phentsize = el16(eh + 0x2a);
+        phnum = el16(eh + 0x2c);
+        if (phentsize < 32) return 0;
+    }
+    if (phnum == 0 || phnum > 256) return 0;
+    size_t phsz = is64 ? 56 : 32;
+    unsigned char ph[56];
+    for (unsigned i = 0; i < phnum; i++) {
+        if (pread(fd, ph, phsz, (off_t)(phoff + (unsigned long long)i * phentsize)) != (ssize_t)phsz)
+            return 0;
+        if (el32(ph) != 3) continue;                 /* PT_INTERP */
+        unsigned long long poff = is64 ? el64(ph + 0x08) : el32(ph + 0x04);
+        unsigned long long pfsz = is64 ? el64(ph + 0x20) : el32(ph + 0x14);
+        if (pfsz == 0 || pfsz > 256) return 0;
+        char interp[257];
+        if (pread(fd, interp, (size_t)pfsz, (off_t)poff) != (ssize_t)pfsz) return 0;
+        interp[pfsz] = '\0';
+        /* musl: /lib/ld-musl-x86_64.so.1 (cualquier arch: "ld-musl-*"). */
+        return mem_find(interp, (size_t)pfsz, "ld-musl", 7);
+    }
+    return 0;
+}
+
+/* Resuelve file contra la entrada PATH de envp (o environ si envp==NULL)
+   y abre el primer candidato legible. Devuelve fd o -1. Necesario para
+   posix_spawnp/execvpe: el nombre llega sin '/' (p.ej. "bwrap"). */
+static int open_via_path(const char *file, char *const envp[]) {
+    static const char defpath[] = ":/bin:/usr/bin";   /* confstr(_CS_PATH) */
+    const char *path = NULL;
+    char *const *e = envp ? envp : environ;
+    for (; e && *e; e++) {
+        if (starts_with(*e, "PATH=")) { path = *e + 5; break; }
+    }
+    if (!path) path = defpath;
+    const char *p = path;
+    for (;;) {
+        const char *colon = p;
+        while (*colon && *colon != ':') colon++;
+        size_t dirlen = (size_t)(colon - p);
+        char cand[4096];
+        size_t fl = strlen(file);
+        if (dirlen + fl + 2 <= sizeof(cand)) {
+            size_t n = 0;
+            if (dirlen == 0) {
+                /* entrada vacia = directorio actual: el nombre tal cual */
+            } else {
+                memcpy(cand, p, dirlen);
+                n = dirlen;
+                cand[n++] = '/';
+            }
+            memcpy(cand + n, file, fl + 1);
+            int fd = open(cand, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) return fd;
+        }
+        if (!*colon) break;
+        p = colon + 1;
+    }
+    return -1;
+}
+
+/* Target musl via fd ya abierto (no lo cierra). Un script #! hereda el
+   env de su shell musl (dash/bash linkean solo libc y sobreviven), pero
+   las herramientas que el script ejecute (git, meson...) si revientan:
+   por eso el shebang tambien cuenta. El interprete de un script es
+   siempre un ELF en la practica; un nivel basta. */
+static int fd_target_musl(int fd) {
+    unsigned char mag[4];
+    if (pread(fd, mag, 4, 0) != 4) return 0;
+    if (mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F')
+        return fd_interp_musl(fd);
+    if (mag[0] == '#' && mag[1] == '!') {
+        char line[272];
+        ssize_t n = pread(fd, line, sizeof(line) - 1, 0);
+        if (n < 3) return 0;
+        line[n] = '\0';
+        char *p = line + 2;
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = p;
+        while (*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
+        size_t il = (size_t)(end - p);
+        if (il == 0 || il >= sizeof(line)) return 0;
+        char interp[272];
+        memcpy(interp, p, il);
+        interp[il] = '\0';
+        /* El kernel NO resuelve PATH en shebang: open tal cual (cwd). */
+        int ifd = open(interp, O_RDONLY | O_CLOEXEC);
+        if (ifd < 0) return 0;
+        int r = fd_interp_musl(ifd);
+        close(ifd);
+        return r;
+    }
+    return 0;
+}
+
+static int path_target_musl(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;                 /* el exec real dara el error */
+    int r = fd_target_musl(fd);
+    close(fd);
+    return r;
+}
+
+/* Copia envp sin LD_LIBRARY_PATH ni LD_PRELOAD (los dos unicos LD_* que
+   el loader musl interpreta y que aqui solo contaminan). Si no hay nada
+   que quitar devuelve el envp original (el caso comun: cero copias). */
+static char **scrub_envp(char *const envp[], int *allocated) {
+    *allocated = 0;
+    if (!envp) return NULL;
+    size_t n = 0;
+    while (envp[n]) n++;
+    size_t need = 0;
+    for (size_t i = 0; i < n; i++)
+        if (starts_with(envp[i], "LD_LIBRARY_PATH=") || starts_with(envp[i], "LD_PRELOAD=")) { need = 1; break; }
+    if (!need) return envp;
+    char **out = (char **)malloc((n + 1) * sizeof(char *));
+    if (!out) return envp;                /* sin memoria: mejor tal cual */
+    size_t j = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (starts_with(envp[i], "LD_LIBRARY_PATH=") || starts_with(envp[i], "LD_PRELOAD=")) continue;
+        out[j++] = envp[i];
+    }
+    out[j] = NULL;
+    *allocated = 1;
+    return out;
+}
+
+/* Exec por PATH resuelto por el caller: 1 si hay que saneear envp. */
+static int target_needs_scrub(const char *file, char *const envp[]) {
+    if (!file || !*file) return 0;
+    int fd;
+    if (strchr(file, '/')) fd = open(file, O_RDONLY | O_CLOEXEC);
+    else fd = open_via_path(file, envp);
+    if (fd < 0) return 0;
+    int r = fd_target_musl(fd);
+    close(fd);
+    return r;
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    int (*real_execve)(const char *, char *const[], char *const[]) =
+        (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execve");
+    if (!real_execve) { errno = ENOSYS; return -1; }
+    if (!g_glibc_host || !path_target_musl(path))
+        return real_execve(path, argv, envp);
+    int alloc = 0;
+    char **nenv = scrub_envp(envp, &alloc);
+    int rc = real_execve(path, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
+}
+
+int execv(const char *path, char *const argv[]) {
+    /* execv(path, argv) == execve(path, argv, environ) */
+    int (*real_execve)(const char *, char *const[], char *const[]) =
+        (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execve");
+    if (!real_execve) { errno = ENOSYS; return -1; }
+    if (!g_glibc_host || !path_target_musl(path))
+        return real_execve(path, argv, environ);
+    int alloc = 0;
+    char **nenv = scrub_envp(environ, &alloc);
+    int rc = real_execve(path, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
+}
+
+/* execvp y execvpe comparten la misma busqueda PATH en glibc; delegar
+   execvp en execvpe con environ conserva la semantica y da una unica
+   rutina de saneo. */
+int execvpe(const char *file, char *const argv[], char *const envp[]);
+
+int execvp(const char *file, char *const argv[]) {
+    return execvpe(file, argv, environ);
+}
+
+int execvpe(const char *file, char *const argv[], char *const envp[]) {
+    int (*real_execvpe)(const char *, char *const[], char *const[]) =
+        (int (*)(const char *, char *const[], char *const[]))dlsym(RTLD_NEXT, "execvpe");
+    if (!real_execvpe) { errno = ENOSYS; return -1; }
+    if (!g_glibc_host || !target_needs_scrub(file, envp))
+        return real_execvpe(file, argv, envp);
+    int alloc = 0;
+    char **nenv = scrub_envp(envp, &alloc);
+    int rc = real_execvpe(file, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
+}
+
+int fexecve(int fd, char *const argv[], char *const envp[]) {
+    int (*real_fexecve)(int, char *const[], char *const[]) =
+        (int (*)(int, char *const[], char *const[]))dlsym(RTLD_NEXT, "fexecve");
+    if (!real_fexecve) { errno = ENOSYS; return -1; }
+    /* fd O_PATH: pread falla -> 0 -> passthrough (edge documentado). */
+    if (!g_glibc_host || !fd_target_musl(fd))
+        return real_fexecve(fd, argv, envp);
+    int alloc = 0;
+    char **nenv = scrub_envp(envp, &alloc);
+    int rc = real_fexecve(fd, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
+}
+
+int posix_spawn(pid_t *pid, const char *path,
+                const posix_spawn_file_actions_t *file_actions,
+                const posix_spawnattr_t *attrp,
+                char *const argv[], char *const envp[]) {
+    int (*real_ps)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                   const posix_spawnattr_t *, char *const[], char *const[]) =
+        (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                 const posix_spawnattr_t *, char *const[], char *const[]))
+        dlsym(RTLD_NEXT, "posix_spawn");
+    if (!real_ps) return ENOSYS;
+    if (!g_glibc_host || !path_target_musl(path))
+        return real_ps(pid, path, file_actions, attrp, argv, envp);
+    int alloc = 0;
+    char **nenv = scrub_envp(envp, &alloc);
+    int rc = real_ps(pid, path, file_actions, attrp, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
+}
+
+int posix_spawnp(pid_t *pid, const char *file,
+                 const posix_spawn_file_actions_t *file_actions,
+                 const posix_spawnattr_t *attrp,
+                 char *const argv[], char *const envp[]) {
+    int (*real_ps)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                   const posix_spawnattr_t *, char *const[], char *const[]) =
+        (int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                 const posix_spawnattr_t *, char *const[], char *const[]))
+        dlsym(RTLD_NEXT, "posix_spawnp");
+    if (!real_ps) return ENOSYS;
+    /* Rust std usa posix_spawnp con nombre sin '/' (p.ej. "bwrap"): hay
+       que resolver PATH contra el envp del hijo para decidir. */
+    if (!g_glibc_host || !target_needs_scrub(file, envp))
+        return real_ps(pid, file, file_actions, attrp, argv, envp);
+    int alloc = 0;
+    char **nenv = scrub_envp(envp, &alloc);
+    int rc = real_ps(pid, file, file_actions, attrp, argv, nenv);
+    if (alloc) free(nenv);
+    return rc;
 }
 
