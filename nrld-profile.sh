@@ -17,6 +17,14 @@
 # LD_PRELOAD debe estar presente cuando se execve el binario glibc:
 # Firefox/Brave heredan el env del parent y las pestanas re-ejecutan la
 # copia parcheada <base>.nrld-<pid> que quedo en el dir del app.
-export LD_PRELOAD=@PROXY@
+# Exportar solo si el proxy existe en el filesystem actual; si no existe
+# (p.ej. chroot sin /usr/lib/neonatox) se desactiva para evitar errores de
+# ld.so al heredar la variable del host.
+PROXY_PATH=@PROXY@
+if [ -f "$PROXY_PATH" ]; then
+  export LD_PRELOAD="$PROXY_PATH"
+else
+  unset LD_PRELOAD
+fi
 export NEONATOX_SYSROOT=@SYSROOT@
 # NEONATOX_PROXY_LOG=/tmp/nrld-proxy.log   # log espejo del proxy (debug pestanas)
