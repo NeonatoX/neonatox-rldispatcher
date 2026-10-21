@@ -16,7 +16,14 @@ interp  = get_option('interp_path')
 glibc_incs = join_paths(sysroot, 'usr', 'include')
 
 nrld = executable('nrld',
-    sources: 'nrld.c',
+    sources: [
+        'nrld.c',
+        'utils.c',
+        'elf_parser.c',
+        'sysroot_manager.c',
+        'appimages.c',
+        'executor.c',
+    ],
     c_args: [
         '-ffreestanding',
         '-fno-stack-protector',

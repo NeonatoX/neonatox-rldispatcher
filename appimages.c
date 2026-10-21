@@ -1,29 +1,46 @@
-/* appimages.c -- AppImage type-2 native handling for nrld.
-   Included from nrld.c (freestanding mode, -nostdlib). Detects a type-2
-   AppImage (non-zero EI_ABIVERSION + embedded squashfs), extracts it to
-   /tmp/nrld-appimage-<pid>/ using the host's musl `unsquashfs` (never
-   writes outside /tmp), locates the real internal ELF binary and collects
-   the internal library dirs (lib/, usr/lib/, usr/lib/<triplet>, plugins/ ...)
-   so the loader can resolve the app's own libs without touching musl /usr. */
+/* ================================================================== */
+/*  appimages.c -- soporte AppImage type-2 para nrld.                  */
+/*                                                                     */
+/*  Detecta un AppImage type-2 (EI_ABIVERSION no estandar + squashfs  */
+/*  embebido), lo extrae a /tmp/nrld-appimage-<pid>/ con el           */
+/*  `unsquashfs` del host (musl; nunca escribe fuera de /tmp),        */
+/*  localiza el binario ELF interno real y recoge los directorios de  */
+/*  librerias internas (lib/, usr/lib/, usr/lib/<triplet>, plugins/)   */
+/*  para que el loader resuelva las libs propias de la app sin tocar  */
+/*  el /usr de musl.                                                   */
+/*                                                                     */
+/*  Depende de: utils.h, nrld_paths.h, elf_parser.h,                   */
+/*               sysroot_manager.h (registro de dirs extra).            */
+/*                                                                     */
+/*  Conceptos clave:                                                  */
+/*    - Descubrimiento del binario interno: AppRun symlink->ELF y      */
+/*      AppRun script '#!' son las entradas canonicas. Un AppRun ELF    */
+/*      plano NO se prioriza (los launchers tipo OpenShot rompen al  */
+/*      correr pelados: TUI de ncurses + check de .desktop).           */
+/*    - Higiene de /tmp: cada AppImage deja ~600 MB, asi que antes de  */
+/*      extraer se barren las extracciones viejas que ningun proceso  */
+/*      vivo referencia (exe/cwd en /proc/<pid>).                      */
+/*    - Plugin Qt: se busca el dir 'platforms/' con .so ->            */
+/*      QT_PLUGIN_PATH (buffer local por llamada: un buffer           */
+/*      compartido rompia los hermanos tras una recursion profunda).   */
+/* ================================================================== */
+
+#include "utils.h"
+#include "nrld_paths.h"
+#include "elf_parser.h"
+#include "sysroot_manager.h"
+#include "appimages.h"
 
 #define APPDIR_PREFIX      "/tmp/nrld-appimage-"
 #define MAX_SCAN_DIRS      512
 #define HUNT_CHUNK         65536
 
-/* The AppImage globals themselves live in nrld.c (before resolve_lib_path);
-   this module is #included after them and only uses them. */
-
-struct linux_dirent64 {
-    unsigned long long d_ino;
-    long long d_off;
-    unsigned short d_reclen;
-    unsigned char d_type;
-    char d_name[256];
-};
-
-#define SYS_getdents64     217
-#define SYS_readlink       89
-#define SYS_rmdir          84
+/* Estado de la extraccion. */
+static char g_appimage_root[4096];
+static char g_appimage_bin[4096];
+static int  g_appimage_extracted = 0;
+static int  g_appimage_script = 0;   /* AppRun es un script #!, se exec directo */
+static char g_qt_plugin_path[4096];
 
 static char scan_path_buf[4096];
 
@@ -56,7 +73,7 @@ static long get_squashfs_offset(const char *path) {
 }
 
 /* AppImage type-2: non-standard e_ident + an embedded squashfs. */
-static int is_appimage(const char *path) {
+int is_appimage(const char *path) {
     char eid[16];
     if (!read_eident(path, eid)) return 0;
     if (eid[8] == 0) return 0;
@@ -90,7 +107,7 @@ static int dir_has_so(const char *dir) {
         if (n <= 0) break;
         long off = 0;
         while (off < n) {
-            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
+            struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
             if (de->d_reclen == 0) break;
             if ((de->d_type & 0xf) == 8 && name_is_so(de->d_name)) { found = 1; break; }
             off += de->d_reclen;
@@ -107,7 +124,7 @@ static int collect_scan_count = 0;
 
 static void collect_libdirs_rec(const char *dir, int depth) {
     if (depth > 3) return;
-    if (g_extra_libdirs_n >= MAX_EXTRA_DIRS) return;
+    if (sysroot_extra_libdir_count() >= MAX_EXTRA_DIRS) return;
     if (collect_scan_count++ >= MAX_SCAN_DIRS) return;
     long fd = syscall2(SYS_open, (long)dir, 0);
     if (fd < 0) return;
@@ -117,7 +134,7 @@ static void collect_libdirs_rec(const char *dir, int depth) {
         if (n <= 0) break;
         long off = 0;
         while (off < n) {
-            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
+            struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
             if (de->d_reclen == 0) break;
             const char *nm = de->d_name;
             if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) {
@@ -127,15 +144,12 @@ static void collect_libdirs_rec(const char *dir, int depth) {
                 my_strcpy(scan_path_buf, dir);
                 my_strcat(scan_path_buf, "/");
                 my_strcat(scan_path_buf, nm);
-                if (dir_has_so(scan_path_buf) && g_extra_libdirs_n < MAX_EXTRA_DIRS) {
-                    my_strcpy(g_extra_libdirs[g_extra_libdirs_n], scan_path_buf);
-                    g_extra_libdirs_n++;
-                }
+                if (dir_has_so(scan_path_buf)) sysroot_add_extra_libdir(scan_path_buf);
                 collect_libdirs_rec(scan_path_buf, depth + 1);
             }
             off += de->d_reclen;
         }
-        if (g_extra_libdirs_n >= MAX_EXTRA_DIRS) break;
+        if (sysroot_extra_libdir_count() >= MAX_EXTRA_DIRS) break;
     }
     syscall1(SYS_close, fd);
 }
@@ -155,7 +169,7 @@ static void collect_qt_plugins_rec(const char *dir, int depth) {
         if (n <= 0) break;
         long off = 0;
         while (off < n) {
-            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
+            struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
             if (de->d_reclen == 0) break;
             const char *nm = de->d_name;
             if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) {
@@ -189,58 +203,6 @@ static void collect_qt_plugin_dir(const char *root) {
     collect_qt_plugins_rec(root, 0);
 }
 
-/* extralibfinder (forward-declared in nrld.c): depth-bounded search for a
-   file named exactly `want` under `root`, preferring the shallowest hit.
-   Only true ELF files count; symlinks (dev packages) are followed. Local
-   buffer per call so an entry name never aliases a deeper frame's path. */
-static int find_lib_under(const char *root, const char *want, char *dir_out, int depth) {
-    if (depth > 3) return 0;
-    long fd = syscall2(SYS_open, (long)root, 0);
-    if (fd < 0) return 0;
-    char buf[8192];
-    int hit = 0;
-    for (;;) {
-        long n = syscall3(SYS_getdents64, fd, (long)buf, sizeof(buf));
-        if (n <= 0) break;
-        long off = 0;
-        while (off < n) {
-            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
-            if (de->d_reclen == 0) break;
-            const char *nm = de->d_name;
-            if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) {
-                off += de->d_reclen; continue;
-            }
-            int t = de->d_type & 0xf;
-            if (t == 8 || t == 10) {                 /* DT_REG / DT_LNK */
-                if (my_strcmp(nm, want) == 0) {
-                    char fp[4096];
-                    my_strcpy(fp, root);
-                    my_strcat(fp, "/");
-                    my_strcat(fp, nm);
-                    if (is_elf(fp)) { my_strcpy(dir_out, root); hit = 1; break; }
-                }
-            } else if (t == 4) {                     /* DT_DIR */
-                char child[4096];
-                my_strcpy(child, root);
-                my_strcat(child, "/");
-                my_strcat(child, nm);
-                if (find_lib_under(child, want, dir_out, depth + 1)) { hit = 1; break; }
-            }
-            off += de->d_reclen;
-        }
-        if (hit) break;
-    }
-    syscall1(SYS_close, fd);
-    return hit;
-}
-
-static int find_lib_in_sysroot(const char *want, char *dir_out) {
-    const char *roots[] = { NEO_SYSROOT "/usr/lib", NEO_SYSROOT "/lib" };
-    for (int i = 0; i < 2; i++)
-        if (find_lib_under(roots[i], want, dir_out, 0)) return 1;
-    return 0;
-}
-
 static int ends_with(const char *s, const char *suf) {
     unsigned int sl = 0, fl = 0;
     while (s[sl]) sl++;
@@ -262,7 +224,7 @@ static int find_elf_exec_in(const char *dir, const char *suffix, char *out) {
         if (n <= 0) break;
         long off = 0;
         while (off < n) {
-            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
+            struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
             if (de->d_reclen == 0) break;
             const char *nm = de->d_name;
             if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) {
@@ -382,35 +344,6 @@ static int appimage_dir_in_use(const char *dir) {
     return in_use;
 }
 
-static void rm_rf(const char *path) {
-    long fd = syscall2(SYS_open, (long)path, 0);
-    if (fd < 0) return;
-    char buf[8192];
-    for (;;) {
-        long n = syscall3(SYS_getdents64, fd, (long)buf, sizeof(buf));
-        if (n <= 0) break;
-        long off = 0;
-        while (off < n) {
-            struct nrl_dirent64 *de = (struct nrl_dirent64 *)(buf + off);
-            if (de->d_reclen == 0) break;
-            const char *nm = de->d_name;
-            if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) {
-                off += de->d_reclen; continue;
-            }
-            char child[4096];
-            my_strcpy(child, path); my_strcat(child, "/"); my_strcat(child, nm);
-            if ((de->d_type & 0xf) == 4) {
-                rm_rf(child);
-            } else {
-                syscall1(SYS_unlink, (long)child);
-            }
-            off += de->d_reclen;
-        }
-    }
-    syscall1(SYS_close, fd);
-    syscall1(SYS_rmdir, (long)path);
-}
-
 static void sweep_stale_appimage_dirs(void) {
     long fd = syscall2(SYS_open, (long)"/tmp", 0);
     if (fd < 0) return;
@@ -448,7 +381,7 @@ static void sweep_stale_appimage_dirs(void) {
 
 /* Extract the AppImage squashfs to /tmp via the host's unsquashfs and locate
    the internal binary + lib dirs. Returns 1 on success (g_appimage_bin set). */
-static int extract_appimage(const char *path) {
+int extract_appimage(const char *path) {
     long off = get_squashfs_offset(path);
     if (off < 0) return 0;
 
@@ -488,7 +421,7 @@ static int extract_appimage(const char *path) {
     }
 
     collect_scan_count = 0;
-    g_extra_libdirs_n = 0;
+    sysroot_reset_extra_libdirs();
     collect_libdirs_rec(g_appimage_root, 0);
     collect_qt_plugin_dir(g_appimage_root);
 
@@ -496,23 +429,8 @@ static int extract_appimage(const char *path) {
     return 1;
 }
 
-/* Append the internal lib dirs of `root` (standard subdirs that exist +
-   the collected g_extra_libdirs) to a ':'-separated path buffer. */
-static void append_lib_subdirs(char *buf, const char *root) {
-    static const char *subs[] = {
-        "/bin", "/usr/bin", "/bin/lib", "/bin/lib64", "/usr/bin/lib64", "/usr/bin/lib",
-        "/lib", "/lib64", "/usr/lib", "/usr/lib64",
-        "/usr/lib/x86_64-linux-gnu", "/usr/lib/i386-linux-gnu"
-    };
-    char d[4096];
-    for (unsigned int i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
-        my_strcpy(d, root); my_strcat(d, subs[i]);
-        if (!file_exists(d)) continue;
-        my_strcat(buf, ":");
-        my_strcat(buf, d);
-    }
-    for (int i = 0; i < g_extra_libdirs_n; i++) {
-        my_strcat(buf, ":");
-        my_strcat(buf, g_extra_libdirs[i]);
-    }
-}
+const char *appimage_root(void)         { return g_appimage_root; }
+const char *appimage_bin(void)          { return g_appimage_bin; }
+int         appimage_extracted(void)   { return g_appimage_extracted; }
+int         appimage_is_script(void)   { return g_appimage_script; }
+const char *appimage_qt_plugin_path(void) { return g_qt_plugin_path; }
