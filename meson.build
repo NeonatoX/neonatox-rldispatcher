@@ -1,5 +1,5 @@
 project('neonatox-rldispatcher', 'c',
-    version: '1.1.0',
+    version: '0.1.0',
     meson_version: '>=0.61',
     default_options: [
         'c_std=gnu99',
