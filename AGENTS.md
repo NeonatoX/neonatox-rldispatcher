@@ -37,7 +37,7 @@ gcc -nostdlib -static -ffreestanding -fno-stack-protector -O2 -s \
 
 Two components working together:
 
-- **`nrld.c`** → Fake dynamic linker installed at `/usr/lib/glibc6/usr/bin/nrld`. Kernel loads this instead of the real `ld-linux-x86-64.so.2`. It determines the real binary, sets up `LD_LIBRARY_PATH`/`LD_PRELOAD`, then either:
+- **`nrld.c`** → Fake dynamic linker instalado en el host en `/usr/lib/neonatox/nrld` (symlink `/lib64/ld-linux-x86-64.so.2` → nrld). El kernel carga nrld en lugar del loader glibc real. Determina el binario real, arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, luego:
   - **Root mode**: forks and swaps symlinks to run under the real linker, then restores symlinks
   - **User mode**: creates a **patched copy of the app in its own directory** (`<appdir>/<base>.nrld-<pid>`, `make_interp_patched_copy()` in `nrld.c`) whose `PT_INTERP` is rewritten to the real loader (the string is embedded at the copy's EOF, so there's no length limit), then `execve`s that copy. The kernel loads the real `ld-linux` **in-process** as a normal interpreter, so `/proc/self/exe` stays the app copy (same dir → resources/omni.ja/icudtl.dat still resolve) and `LD_LIBRARY_PATH`/`LD_PRELOAD` are inherited from the env. No more `--library-path` flag needed; identical search precedence (env == flag).
   - **Fallback**: if the copy can't be created (app dir not writable) or the ELF has no `PT_INTERP` (static/musl binary), nrld falls back to the old `execve(REAL_LOADER, [--library-path, ...])`.
@@ -48,8 +48,8 @@ Two components working together:
 
 - **x86-64 only** — uses raw `syscall` instructions and x86-64 register conventions
 - **No libc in nrld** — all functions reimplemented via raw syscalls (no malloc, no printf, etc.)
-- **Hardcoded paths** — `REAL_LOADER`, `INTERP_PATH`, `SYSROOT_LIBS` etc. are compile-time constants in `nrld.c` (around `nrld.c:765-775`)
-- **Installation requires root** — binaries go to `/usr/lib/glibc6/` which needs to exist
+- **Hardcoded paths** — `REAL_LOADER`, `INTERP_PATH`, `SYSROOT_LIBS` etc. are compile-time constants in `nrld.c` (around `nrld.c:810-820`, `NEO_SYSROOT`/`NEO_BINDIR`)
+- **Installation requires root** — binaries y config van al host (`/usr/lib/neonatox/`, `/etc/nrld.conf`, `/etc/profile.d/nrld-profile.sh`) y se crea el symlink `/lib64/ld-linux-x86-64.so.2`; el sysroot glibc queda en `/usr/lib/glibc6/`
 - Code comments and README are in Spanish
 
 ## Known behavior

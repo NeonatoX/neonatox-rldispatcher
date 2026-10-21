@@ -21,12 +21,12 @@ entorno musl del host (sin mezclar dos libcs en un mismo proceso).
 
 | Archivo | Líneas | Rol |
 |---|---|---|
-| `nrld.c` | 1457 | El fake loader (freestanding, sin libc). Detecta el binario, lee `/etc/nrld.conf` (host), arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, guard transitivo de NEEDED, y en **modo usuario** ejecuta una copia patcheada `<base>-nrld-<pid>` (mismo dir del app, `PT_INTERP` → loader real) para que el kernel cargue el loader glibc **in-process** y `/proc/self/exe` siga apuntando a la app. |
-| `appimages.c` | 386 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el **extralibfinder**. Se `#include` desde `nrld.c`. |
-| `proxy_readlink.c` | 588 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + cache de veredictos + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
+| `nrld.c` | 1756 | El fake loader (freestanding, sin libc). Detecta el binario, lee `/etc/nrld.conf` (host), arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, guard transitivo de NEEDED, y en **modo usuario** ejecuta una copia patcheada `<base>-nrld-<pid>` (mismo dir del app, `PT_INTERP` → loader real) para que el kernel cargue el loader glibc **in-process** y `/proc/self/exe` siga apuntando a la app. |
+| `appimages.c` | 518 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el **extralibfinder**. Se `#include` desde `nrld.c`. |
+| `proxy_readlink.c` | 937 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + cache de veredictos + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
 | `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y el test E2E. |
-| `nrld.conf` | 12 | Plantilla de `/etc/nrld.conf` (host): `key = value` — `library_path` (LD_LIBRARY_PATH), `proxy` (LD_PRELOAD) y la clave `strict` (modo estricto global). |
-| `nrld-profile.sh` | 17 | Plantilla de `/etc/profile.d/nrld-profile.sh`: env `LD_PRELOAD`/`LD_LIBRARY_PATH`/`NEONATOX_SYSROOT` para que las pestañas de Firefox/Brave hereden el proxy (ver **Uso**). |
+| `nrld.conf` | 16 | Plantilla de `/etc/nrld.conf` (host): `key = value` — `library_path` (LD_LIBRARY_PATH), `proxy` (LD_PRELOAD) y la clave `strict` (modo estricto global). |
+| `nrld-profile.sh` | 29 | Plantilla de `/etc/profile.d/nrld-profile.sh`: exporta `LD_PRELOAD` **condicionalmente** si el proxy existe en el filesystem (evita errores en chroot) y `NEONATOX_SYSROOT`; **no** exporta `LD_LIBRARY_PATH` (se inyecta por nrld). Sirve para que las pestañas de Firefox/Brave hereden el proxy (ver **Uso**). |
 | `scripts/post-install.sh` | 20 | Refresca el cache `ldconfig` del sysroot glibc (`-n` con los dirs del sysroot); no fatal, salta con `DESTDIR`. |
 | `test/gen_probes.py` | 134 | Genera ELF64 x86-64 mínimos de prueba (struct-only, sin toolchain glibc): `need_vdpau` (NEEDED `libvdpau_trace.so.1`) y `need_missing` (NEEDED inexistente). |
 | `test/run_tests.sh` | 61 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl, **canal stdout limpio** (regresión de Investigación 05: nrld no escribe nada por defecto y el diagnóstico con `NRLD_DEBUG=3` va a stderr). |
@@ -333,10 +333,7 @@ los binarios musl del host (ver `test/run_tests.sh`, caso 4).
 - **OpenShot 4.0.0** (AppImage): arranca completo bajo Xvfb con strict (Qt `xcb` cargado vía
   `QT_PLUGIN_PATH`, sin `[neonatox] Falta`). El plugin Qt se detectó tras arreglar el buffer
   compartido del scan recursivo.
-- **Firefox**: abre ventana (pestañas aún pendientes). **OCAT**: abre. **Brave**: llega al
-  exec del loader; sin proxy falla ICU (esperado, lo corrige el proxy con `readlink`);
-  pendiente re-test con el proxy con verdict-cache y si hace falta `--no-sandbox`/
-  `--disable-gpu`/`--disable-dev-shm-usage`.
+- **Firefox**: antiguo y moderno ejecutan correctamente bajo nrld, incluyendo pestañas que re-ejecutan su propio binario; ESR verificado. **OCAT**: abre. **Brave**: ejecuta completo con el proxy activo (verdict-cache y readlink gate funcionando).
 - **Procesos hijo que re-ejecutan su binario (pestañas Firefox/Brave)**: fail-mode clásico
   era "process N exited with status 1" (el hijo resolvía `/proc/self/exe` por una vía que
   sortea el `LD_PRELOAD` del proxy y, bajo el esquema viejo loader-as-main, re-ejecutaba el
