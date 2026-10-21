@@ -28,18 +28,39 @@ gcc -nostdlib -shared -fPIC -o libnrld-proxy.so \
     -I/usr/lib/glibc6/usr/include \
     proxy_readlink.c
 
-# 2. Fake loader binary (freestanding, no libc)
+# 2. Fake loader binary (freestanding, no libc) -- un TU por modulo
 gcc -nostdlib -static -ffreestanding -fno-stack-protector -O2 -s \
-    -o nrld nrld.c
+    -o nrld \
+    nrld.c utils.c elf_parser.c sysroot_manager.c appimages.c executor.c
 ```
 
 ## Architecture
 
-Two components working together:
+`nrld` está dividido en módulos (uno por .c, compilados juntos por meson). Las
+dependencias van en **una sola dirección**, sin ciclos:
 
-- **`nrld.c`** → Fake dynamic linker instalado en el host en `/usr/lib/neonatox/nrld` (symlink `/lib64/ld-linux-x86-64.so.2` → nrld). El kernel carga nrld en lugar del loader glibc real. Determina el binario real, arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, luego:
+```
+utils  <-  elf_parser  <-  sysroot_manager  <-  appimages  <-  executor  <-  nrld (entry)
+```
+
+| Módulo | Rol |
+|---|---|
+| `nrld.c` | Solo el stub de entrada `_start` (asm) que pasa el stack a `nrld_main()`. |
+| `utils.c/.h` | Runtime freestanding: syscalls crudos `syscall0..4`, strings, log por niveles a stderr, helpers de fichero/ruta, `rm_rf`. |
+| `elf_parser.c/.h` | Solo formato ELF: `is_elf`, `read_eident`, `get_needed_names`, `maybe_patch_abi_version`, `make_interp_patched_copy` (+ sweep de copias). |
+| `sysroot_manager.c/.h` | Política musl<->glibc: `resolve_lib_path`, extralibfinder (`find_lib_under`/`find_lib_in_sysroot`), `create_shadow_copy`, guard transitivo (`scan_missing_libs`/`check_needed_libs`), `/etc/nrld.conf` (`sysroot_load_conf`), dirs extra de libs. |
+| `appimages.c/.h` | AppImage type-2: extracción squashfs, binario interno, walkers de libs internas y plugin Qt. |
+| `executor.c/.h` | Flujo principal: env/auxv, modo root vs usuario, watchdog, `launcher_bin_redirect`, `cleanup_run_residue`, `--help`. |
+| `nrld_paths.h` | Constantes de compilación compartidas (`NEO_SYSROOT`, `NEO_BINDIR`, loader real, dirs del sysroot, `GCONV_DIR`, proxy). |
+
+El estado compartido se expone con **funciones de acceso** (no con globales
+abiertos): cada módulo es dueño de sus datos.
+
+Dos componentes working together:
+
+- **nrld** (`nrld.c` + módulos) → Fake dynamic linker instalado en el host en `/usr/lib/neonatox/nrld` (symlink `/lib64/ld-linux-x86-64.so.2` → nrld). El kernel carga nrld en lugar del loader glibc real. Determina el binario real, arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, luego:
   - **Root mode**: forks and swaps symlinks to run under the real linker, then restores symlinks
-  - **User mode**: creates a **patched copy of the app in its own directory** (`<appdir>/<base>.nrld-<pid>`, `make_interp_patched_copy()` in `nrld.c`) whose `PT_INTERP` is rewritten to the real loader (the string is embedded at the copy's EOF, so there's no length limit), then `execve`s that copy. The kernel loads the real `ld-linux` **in-process** as a normal interpreter, so `/proc/self/exe` stays the app copy (same dir → resources/omni.ja/icudtl.dat still resolve) and `LD_LIBRARY_PATH`/`LD_PRELOAD` are inherited from the env. No more `--library-path` flag needed; identical search precedence (env == flag).
+  - **User mode**: creates a **patched copy of the app in its own directory** (`<appdir>/<base>.nrld-<pid>`, `make_interp_patched_copy()` in `elf_parser.c`) whose `PT_INTERP` is rewritten to the real loader (the string is embedded at the copy's EOF, so there's no length limit), then `execve`s that copy. The kernel loads the real `ld-linux` **in-process** as a normal interpreter, so `/proc/self/exe` stays the app copy (same dir → resources/omni.ja/icudtl.dat still resolve) and `LD_LIBRARY_PATH`/`LD_PRELOAD` are inherited from the env. No more `--library-path` flag needed; identical search precedence (env == flag).
   - **Fallback**: if the copy can't be created (app dir not writable) or the ELF has no `PT_INTERP` (static/musl binary), nrld falls back to the old `execve(REAL_LOADER, [--library-path, ...])`.
 
 - **`proxy_readlink.c`** → `LD_PRELOAD` library that intercepts `readlink("/proc/self/exe")` to return the real binary path instead of the fake loader path — **only in loader-as-main mode** (detected via a raw `readlink` of `/proc/self/exe` whose basename is `ld-*`; in user mode the kernel already answers with the app copy and the rewrite is skipped, else Chromium/Electron SIGTRAP). Also enforces the strict sysroot dlopen allowlist (see below), and **scrubs `LD_LIBRARY_PATH`/`LD_PRELOAD` from the envp passed to musl targets** through interposed `execve*`/`posix_spawn*` (see "LD_* scrub on exec" below). Freestanding (built with `-nostdlib`): no `NEEDED`, libc symbols resolved by glibc at runtime.
@@ -48,7 +69,7 @@ Two components working together:
 
 - **x86-64 only** — uses raw `syscall` instructions and x86-64 register conventions
 - **No libc in nrld** — all functions reimplemented via raw syscalls (no malloc, no printf, etc.)
-- **Hardcoded paths** — `REAL_LOADER`, `INTERP_PATH`, `SYSROOT_LIBS` etc. are compile-time constants in `nrld.c` (around `nrld.c:810-820`, `NEO_SYSROOT`/`NEO_BINDIR`)
+- **Hardcoded paths** — `REAL_LOADER`, `INTERP_PATH`, `SYSROOT_LIBS` etc. are compile-time constants in `nrld_paths.h` (`NEO_SYSROOT`/`NEO_BINDIR`)
 - **Installation requires root** — binaries y config van al host (`/usr/lib/neonatox/`, `/etc/nrld.conf`, `/etc/profile.d/nrld-profile.sh`) y se crea el symlink `/lib64/ld-linux-x86-64.so.2`; el sysroot glibc queda en `/usr/lib/glibc6/`
 - Code comments and README are in Spanish
 
@@ -67,9 +88,9 @@ children re-exec (real loader interp), so the report's make/lto-wrapper failure 
 occurs even in the loader-as-main fallback — diagnostics just don't pollute the parent's
 captured stdout.
 
-`nrld` must NOT try to load non-ELF files, or it recursively intercepts processes that exec non-binaries (e.g. Firefox launching a crash handler over a `.dmp` file, which segfaults with "invalid ELF header"). Early-exit guard: `is_elf()` check after `file_exists()` in `nrld.c` — non-ELF files cause an immediate clean `exit(0)`.
+`nrld` must NOT try to load non-ELF files, or it recursively intercepts processes that exec non-binaries (e.g. Firefox launching a crash handler over a `.dmp` file, which segfaults with "invalid ELF header"). Early-exit guard: `is_elf()` check after `file_exists()` (`elf_parser.c`) — non-ELF files cause an immediate clean `exit(0)`.
 
-**AppImage / type-2 ELFs (`EI_ABIVERSION`):** AppImage-style ELFs carry a non-zero `EI_ABIVERSION` (byte 8 of `e_ident`, e.g. `0x41`/"AI"), which the glibc loader **rejects outright** with "ELF file ABI version invalid" — before any NEEDED/lib logic. `maybe_patch_abi_version()` (in `nrld.c`) detects a non-zero byte 8 after the `is_elf` check and creates a **patched copy** in `/tmp/nrld-<pid>/` with that byte zeroed, then execs the copy instead of the original. Original path is untouched and kept for `NEONATOX_REAL_EXE` (dlopen allowlist). Verified: ABI-65 ELF → patched copy `ABIVERSION=0` exec'd; normal ELFs are run as-is (no patch).
+**AppImage / type-2 ELFs (`EI_ABIVERSION`):** AppImage-style ELFs carry a non-zero `EI_ABIVERSION` (byte 8 of `e_ident`, e.g. `0x41`/"AI"), which the glibc loader **rejects outright** with "ELF file ABI version invalid" — before any NEEDED/lib logic. `maybe_patch_abi_version()` (in `elf_parser.c`) detects a non-zero byte 8 after the `is_elf` check and creates a **patched copy** in `/tmp/nrld-<pid>/` with that byte zeroed, then execs the copy instead of the original. Original path is untouched and kept for `NEONATOX_REAL_EXE` (dlopen allowlist). Verified: ABI-65 ELF → patched copy `ABIVERSION=0` exec'd; normal ELFs are run as-is (no patch).
 
 **Children that re-exec their own binary (Firefox/Chromium tabs, `process exited with status 1`):** Firefox + Brave content processes are spawned by re-exec'ing their own executable. They resolve it through `/proc/self/exe` by mechanisms that **bypass LD_PRELOAD** (`open`+`read` of the magic symlink, or a raw `readlink` syscall), so the proxy's interposed libc `readlink` never fires. Under the old user mode (`execve(REAL_LOADER, [--library-path, ...])`) the kernel's `/proc/self/exe` was the loader, so children re-exec'd the loader **as the program**: glibc treats the first non-option argv as the app, fails, and exits 1 (the observed "process N exited with status 1" storm; those PIDs never show a `[DEBUG] NeonatoX` line). Fixed by **user-mode** executing a patched copy (`make_interp_patched_copy`) whose `PT_INTERP` is the real loader: the kernel loads it **in-process**, `/proc/self/exe` is the copy inside the app dir, and children re-exec it successfully through ANY mechanism — no nrld, no loader-as-main, no interposition required. Children that run this way are glibc-natural: inherited `LD_LIBRARY_PATH`/`LD_PRELOAD` configures the in-process loader identically. **Residue cleanup (watchdog):** before exec'ing the copy nrld forks a tiny **watchdog** that polls `kill(getppid(), 0)` + `/proc/<parent>/stat` (30 ms) until the app (the process nrld became via execve) dies, then unlinks the copy `<base>-nrld-<pid>`, the ABI-patch dir `/tmp/nrld-<pid>`, the AppImage extraction and the DT_NEEDED-absolute patches — so nothing is left after a normal exit (verified: `need_vdpau` leaves 0 copies over repeated runs). The sweep in `make_interp_patched_copy()` stays as a backstop for the marginal cases (app SIGKILL'd/Ctrl-C'd: both processes in the group die before the watchdog cleans; a child that outlives the main and re-execs the copy after it's gone). Removing the copy *early* (while the app lives) is still forbidden — children re-exec that path while the tree runs.
 
@@ -87,7 +108,7 @@ Verified end-to-end in this env: `needvdpau2` (PT_INTERP + NEEDED `libvdpau_trac
 
 **Extraction dir hygiene:** each AppImage launch leaves ~600 MB in `/tmp/nrld-appimage-<pid>/` (extraction + `heroic-nrld-<pid>` copy), so `extract_appimage` first runs `sweep_stale_appimage_dirs`: any `/tmp/nrld-appimage-*` dir that no live process references (no `/proc/<pid>/exe` inside it, no `/proc/<pid>/cwd` == it) is recursively removed. A running instance keeps its own dir (its exe/cwd live there); stale dirs from exited runs are cleaned on the next launch. With the watchdog, the extraction dir of a run is also removed at app exit (`cleanup_run_residue`), so fresh runs usually don't even hit the sweep.
 
-**Mozilla-launcher binaries (`firefox`/`firefox-bin`, Firefox moderno + ESR regression, fixed):** the `firefox` shipped in official tarballs (also `firefox-esr`, Living the same in `/home/neonatox/Descargas/`) is NOT a script — it's a tiny ELF (only `libc`/`libpthread` NEEDED) whose `main` resolves the real binary via `readlink("/proc/self/exe")` and appends `-bin` (strings: `/proc/self/exe`, `-bin`, `Couldn't find the application directory.`, `Exec failed with error: %s`). In user mode `/proc/self/exe` is the patched copy `<dir>/firefox-nrld-<pid>`, so the derived target is `<dir>/firefox-nrld-<pid>-bin` → **`Exec failed with error: No such file or directory`** (reproduced; also affected ESR). Feed `firefox-bin` directly (patched copy) → browser starts (fontconfig init + full process tree, previously "Firefox moderno runs" only because we had launched `firefox-bin` directly). Fix: `launcher_bin_redirect()` in nrld.c — in user mode, if the target basename is `X` and a sibling `X-bin` exists in the same dir and is an ELF, nrld redirects to `X-bin` (same argv, skips the launcher). Root mode is untouched (the launcher runs natively there and its `/proc/self/exe` is the app path). Verified live: both Descargas Firefox build and ESR reach a running browser (Socket/RDD/GPU + main processes); Tor Browser unaffected (`firefox.real` is the app, not a launcher pair). Wine diagnostic (context): Proton-CachyOS wine 11 runs under nrld user mode up to its own preloader which needs `/lib/ld-linux.so.2` (32-bit) for ANY PE — host musl has no multilib, so wine needs a 32-bit glibc in the sysroot or a wow64 runner.
+**Mozilla-launcher binaries (`firefox`/`firefox-bin`, Firefox moderno + ESR regression, fixed):** the `firefox` shipped in official tarballs (also `firefox-esr`, Living the same in `/home/neonatox/Descargas/`) is NOT a script — it's a tiny ELF (only `libc`/`libpthread` NEEDED) whose `main` resolves the real binary via `readlink("/proc/self/exe")` and appends `-bin` (strings: `/proc/self/exe`, `-bin`, `Couldn't find the application directory.`, `Exec failed with error: %s`). In user mode `/proc/self/exe` is the patched copy `<dir>/firefox-nrld-<pid>`, so the derived target is `<dir>/firefox-nrld-<pid>-bin` → **`Exec failed with error: No such file or directory`** (reproduced; also affected ESR). Feed `firefox-bin` directly (patched copy) → browser starts (fontconfig init + full process tree, previously "Firefox moderno runs" only because we had launched `firefox-bin` directly). Fix: `launcher_bin_redirect()` in `executor.c` — in user mode, if the target basename is `X` and a sibling `X-bin` exists in the same dir and is an ELF, nrld redirects to `X-bin` (same argv, skips the launcher). Root mode is untouched (the launcher runs natively there and its `/proc/self/exe` is the app path). Verified live: both Descargas Firefox build and ESR reach a running browser (Socket/RDD/GPU + main processes); Tor Browser unaffected (`firefox.real` is the app, not a launcher pair). Wine diagnostic (context): Proton-CachyOS wine 11 runs under nrld user mode up to its own preloader which needs `/lib/ld-linux.so.2` (32-bit) for ANY PE — host musl has no multilib, so wine needs a 32-bit glibc in the sysroot or a wow64 runner.
 
 ## musl ↔ glibc ABI isolation (CRITICAL)
 
@@ -98,7 +119,7 @@ The host is **musl-based** (`/lib/ld-musl-x86-64.so.1`), `/usr/lib/glibc6/` is t
 - **Fix strategy:** place **glibc** builds of the entire GNOME stack in `/usr/lib/glibc6/usr/lib`. Verified precedence: glibc's loader searches `--library-path`/`LD_LIBRARY_PATH` **before** its compiled-in system path `/usr/lib`, so sysroot copies always win over musl ones.
 - **NOTE:** `--inhibit-rpath`/`--inhibit-cache` do **NOT** block the loader from falling back to its compiled-in `/usr/lib` when a lib is absent in the sysroot; a missing sysroot lib silently resolves to musl `/usr/lib`. Keeping musl out therefore requires a complete sysroot GUI stack, not loader flags.
 
-### Pre-flight NEEDED coverage guard (in `nrld.c`)
+### Pre-flight NEEDED coverage guard (in `sysroot_manager.c`)
 
 `nrld` parses the target ELF's `DT_NEEDED` sonames (via `PT_DYNAMIC`/`PT_LOAD` vaddr→offset mapping) and — since the guard is now **transitive** — also the `DT_NEEDED` of every library that resolves inside the sysroot (see "Transitive NEEDED guard" below), checking each is resolvable in `bin_dir` + the sysroot dirs. If a NEEDED lib is missing from the sysroot (so glibc would fall back to musl `/usr/lib` and mix ABIs):
 - **Default:** prints an `[ADV]` warning naming the lib, but still runs (non-GUI binary baseline unaffected).
@@ -117,5 +138,5 @@ Firefox's GTK/ICU/Pango come via **runtime `dlopen`** of `libxul.so`, not static
 
 ### Transitive NEEDED guard (nrld)
 
-The pre-flight guard was widened from the top binary's direct `DT_NEEDED` to a **transitive closure** (`scan_missing_libs` in `nrld.c`): it walks the dependency tree, and for every library that resolves inside the sysroot it also inspects that library's own `DT_NEEDED`, so a musl-only dependency hidden one level down is reported. Covers apps whose whole dep tree is statically linked (most standalone binaries / AppImages). It does NOT cover `dlopen`'d trees (Firefox's `libxul`) — that's the proxy link-map scan's job. Cycle/dedup via a visited soname set (depth-bounded at 512).
+The pre-flight guard was widened from the top binary's direct `DT_NEEDED` to a **transitive closure** (`scan_missing_libs` in `sysroot_manager.c`): it walks the dependency tree, and for every library that resolves inside the sysroot it also inspects that library's own `DT_NEEDED`, so a musl-only dependency hidden one level down is reported. Covers apps whose whole dep tree is statically linked (most standalone binaries / AppImages). It does NOT cover `dlopen`'d trees (Firefox's `libxul`) — that's the proxy link-map scan's job. Cycle/dedup via a visited soname set (depth-bounded at 512).
 

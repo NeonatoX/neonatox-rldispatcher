@@ -21,8 +21,13 @@ entorno musl del host (sin mezclar dos libcs en un mismo proceso).
 
 | Archivo | Líneas | Rol |
 |---|---|---|
-| `nrld.c` | 1756 | El fake loader (freestanding, sin libc). Detecta el binario, lee `/etc/nrld.conf` (host), arma `LD_LIBRARY_PATH`/`LD_PRELOAD`, guard transitivo de NEEDED, y en **modo usuario** ejecuta una copia patcheada `<base>-nrld-<pid>` (mismo dir del app, `PT_INTERP` → loader real) para que el kernel cargue el loader glibc **in-process** y `/proc/self/exe` siga apuntando a la app. |
-| `appimages.c` | 518 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el **extralibfinder**. Se `#include` desde `nrld.c`. |
+| `nrld.c` | 36 | Punto de entrada: solo el stub de entrada `_start` (asm) que pasa el stack al `executor`. |
+| `executor.c` / `.h` | 762 | Flujo principal: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual vs directo, guard no-ELF, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_*`, sanitización de `LD_*`, **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (copia parcheada → loader glibc **in-process**), watchdog y limpieza de residuos, `--help`. |
+| `utils.c` / `.h` | 212 | Runtime freestanding compartido: syscalls crudos `syscall0..4`, strings (`my_strlen/cpy/cat/cmp`), log por niveles a stderr (`print_msg`/`print_out`/`print_err`), helpers de fichero/ruta (`file_exists`, `uint_to_str`, `read_at`, `resolve_path`, `get_directory`, `can_write_dir`) y `rm_rf`. |
+| `elf_parser.c` / `.h` | 412 | Solo **formato ELF**: `e_ident`, `DT_NEEDED` (`PT_DYNAMIC`/`PT_LOAD`, vaddr→offset), el parche de `EI_ABIVERSION` (AppImage/type-2) y la copia con `PT_INTERP` reescrito al loader real (con self-sweep de copias viejas). |
+| `sysroot_manager.c` / `.h` | 471 | Política de aislamiento musl↔glibc: resolución de sonames (dir del binario + subdirs estándar + dirs extra + sysroot, con fallback **extralibfinder**), guard **transitivo** de `DT_NEEDED`, copias parcheadas de NEEDED absolutos (`shadow`), lectura de `/etc/nrld.conf` y registro de directorios extra de librerías. |
+| `appimages.c` / `.h` | 419 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el barrido de extracciones viejas. |
+| `nrld_paths.h` | 26 | Constantes de compilación compartidas: `NEO_SYSROOT`/`NEO_BINDIR` (overridables con `-D`), loader real, ruta del interp, dirs del sysroot, `GCONV_DIR`, proxy. |
 | `proxy_readlink.c` | 937 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + cache de veredictos + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
 | `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y el test E2E. |
 | `nrld.conf` | 16 | Plantilla de `/etc/nrld.conf` (host): `key = value` — `library_path` (LD_LIBRARY_PATH), `proxy` (LD_PRELOAD) y la clave `strict` (modo estricto global). |
@@ -116,23 +121,52 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 
 ## Secciones de los archivos y qué resuelven
 
-### `nrld.c`
+> `nrld` está dividido en módulos compilados por separado (uno por TU). Las
+> dependencias van en una sola dirección: `utils` ← `elf_parser` ←
+> `sysroot_manager` ← `appimages` ← `executor` ← `nrld` (entry). El estado
+> compartido se expone con funciones de acceso (no con globales abiertos), de
+> modo que cada módulo es dueño de sus datos.
 
-| Sección | Refs. | Qué resuelve |
-|---|---|---|
-| Helpers sin libc | syscalls `syscallN()`, `my_strlen/cpy/cat/cmp`, `print_msg/print_out/print_err`, `file_exists`, `uint_to_str`, `is_elf` | Todo el runtime freestanding (no hay `malloc`/`printf`). `print_msg` = log por niveles a **stderr** (silencio por defecto, ver `--help`), `print_out` = stdout (solo `--help`), `print_err` = errores duros a stderr siempre. |
-| `read_eident`, `copy_bytes` | ~123 | Lee `e_ident` y copia archivos en chunks (para parchear). |
-| `maybe_patch_abi_version` | ~166 | Los ELF type-2/AppImage llevan `EI_ABIVERSION != 0` y el loader glibc los **rechaza**; crea copia parcheada en `/tmp/nrld-<pid>/` y ejecuta la copia (el original queda intacto). |
-| Globals AppImage + forward `find_lib_in_sysroot` | ~230 | Estado compartido (antes del `#include "appimages.c"`). |
-| `resolve_lib_path` | ~265 | Soname → ruta: dir del binario + subdirs estándar + `g_extra_libdirs` + sysroot; con fallback **extralibfinder**. |
-| `get_needed_names` | ~319 | Parsea `DT_NEEDED` de un ELF (vía `PT_DYNAMIC`/`PT_LOAD`, vaddr→offset). |
-| `create_shadow_copy` | ~442 | `DT_NEEDED` con **ruta absoluta** (e.g. `libxul.so`): el loader ignora el path pero pierde la lib; se traduce a soname en una copia parcheada que `--library-path` sí resuelve. |
-| `scan_missing_libs` / `check_needed_libs` | ~524 / ~622 | Guard **transitivo** de cobertura NEEDED (BFS con visited, ciclo/dedup acotado a 512): recorre los `DT_NEEDED` de cada lib que resuelve dentro del sysroot. |
-| `load_nrld_conf` | ~650 | Lee `/etc/nrld.conf` (host, lo escribe el instalador) por raw syscalls: `library_path`/`proxy` (overrides de LD_LIBRARY_PATH/LD_PRELOAD), token `strict` → todas las apps estrictas sin prefijo env, y `log_level` (nivel de log global, sustituible por `NRLD_DEBUG` por proceso). |
-| `make_interp_patched_copy` | ~846 | Crea la copia parcheada `<base>-nrld-<pid>` en el dir del app (interp → loader real embebido al EOF, sin límite), self-sweep de copias viejas. |
+### `utils.c`
+
+| Sección | Qué resuelve |
+|---|---|
+| `syscall0..4` | Wrappers de syscalls crudos x86-64 (asm `syscall`), sin libc. |
+| `my_strlen/cpy/cat/cmp`, `my_starts_with` | Strings sin libc. |
+| `print_msg` / `print_out` / `print_err` + `g_log_level` | Log por niveles: `print_msg` = diagnóstico a **stderr** (silencio por defecto, ver `--help`), `print_out` = stdout (solo `--help`), `print_err` = errores duros a stderr siempre. El nivel se deriva del prefijo de cada línea (`[ERROR]`/`[ADV]`/`[INFO]`/`[OK]`/sin prefijo → debug). |
+| `file_exists`, `uint_to_str`, `read_at` | Helpers de fichero. |
+| `resolve_path`, `get_directory`, `can_write_dir` | Helpers de ruta (absoluta, directorio padre, permiso de escritura). |
+| `rm_rf` | Borrado recursivo de un árbol (limpieza de extracciones AppImage y dirs de parches en `/tmp`). |
+
+### `elf_parser.c`
+
+| Sección | Qué resuelve |
+|---|---|
+| `read_eident`, `is_elf` | Lectura de la cabecera ELF y detección de la firma. |
+| `copy_file_contents` | Copia de ficheros en chunks de 64 KB (para parchear). |
+| `maybe_patch_abi_version` | Los ELF type-2/AppImage llevan `EI_ABIVERSION != 0` y el loader glibc los **rechaza**; crea copia parcheada en `/tmp/nrld-<pid>/` y ejecuta la copia (el original queda intacto). |
+| `get_needed_names` | Parsea `DT_NEEDED` de un ELF (vía `PT_DYNAMIC`/`PT_LOAD`, vaddr→offset) y su `DT_SONAME`. |
+| `make_interp_patched_copy` | Crea la copia parcheada `<base>-nrld-<pid>` en el dir del app (interp → loader real embebido al EOF, sin límite), con self-sweep de copias viejas (`nrld_copy_in_use` + `sweep_stale_interp_copies`: una copia se conserva solo mientras algún proceso vivo la tiene como `/proc/self/exe`). |
+
+### `sysroot_manager.c`
+
+| Sección | Qué resuelve |
+|---|---|
+| `resolve_lib_path` | Soname → ruta: dir del binario + subdirs estándar + `g_extra_libdirs` + sysroot; con fallback **extralibfinder**. |
+| `find_lib_under` / `find_lib_in_sysroot` | **Extralibfinder**: localiza un soname faltante recursivamente en subdirectorios no estándar del sysroot (`gvfs/`, `pulseaudio/`, `engines-3/`, `dri/`...) y registra el dir para `resolve_lib_path` + `--library-path`. Nunca mira musl `/usr/lib`. |
+| `create_shadow_copy` | `DT_NEEDED` con **ruta absoluta** (e.g. `libxul.so`): el loader ignora el path pero pierde la lib; se traduce a soname en una copia parcheada que `--library-path` sí resuelve. |
+| `scan_missing_libs` / `check_needed_libs` | Guard **transitivo** de cobertura NEEDED (BFS con visited, ciclo/dedup acotado a 512): recorre los `DT_NEEDED` de cada lib que resuelve dentro del sysroot. |
+| `sysroot_load_conf` | Lee `/etc/nrld.conf` (host, lo escribe el instalador) por raw syscalls: `library_path`/`proxy` (overrides de LD_LIBRARY_PATH/LD_PRELOAD), token `strict` → todas las apps estrictas sin prefijo env, y `log_level` (nivel de log global, sustituible por `NRLD_DEBUG` por proceso). |
+| `sysroot_*_extra_libdir*`, `append_lib_subdirs` | Registro de directorios extra de librerías (AppImage interno, subdirs no estándar) y montaje de la lista `:` para `LD_LIBRARY_PATH`. |
+
+### `executor.c`
+
+| Sección | Qué resuelve |
+|---|---|
+| `nrld_main` | Entrada: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual (`nrld BIN`) vs directo (`PT_INTERP`), guard no-ELF, lectura de conf, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_REAL_EXE`/`NEONATOX_SYSROOT`, sanitización de `LD_*`, y el **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (`make_interp_patched_copy` → exec de la copia parcheada con el loader in-process; fallback al exec directo del loader real si no hay `PT_INTERP` o el dir no es escribible). |
 | `cleanup_run_residue` + watchdog | Antes del `execve` de la copia, nrld fork un **watchdog** que espera (poll `kill(getppid(),0)` + `/proc/<pid>/stat` a 30 ms) a que la app muera y borra los residuos del run: la copia `<base>-nrld-<pid>`, el dir ABI `/tmp/nrld-<pid>`, la extracción AppImage y los parches de DT_NEEDED absolutos — nada queda tras salir con normalidad (verificado: corridas repetidas dejan 0 copias). El self-sweep sigue como red de seguridad (kill/Ctrl-C matan al grupo antes de limpiar). |
-| `_start_main` | ~1001 | Entrada: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual (`nrld BIN`) vs directo (`PT_INTERP`), guard no-ELF, lectura de conf, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_REAL_EXE`/`NEONATOX_SYSROOT`, sanitización de `LD_*`, y el **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (`make_interp_patched_copy` → exec de la copia parcheada con el loader in-process; fallback al exec directo del loader real si no hay `PT_INTERP` o el dir no es escribible). |
-| `print_usage_help` | ~945 | El `--help` (stdout, es salida pedida). |
+| `launcher_bin_redirect` | Launcher estilo mozilla (`firefox`/`firefox-bin`, `thunderbird`...): el launcher es un ELF pequeño que deriva el binario real con `readlink("/proc/self/exe")` + `"-bin"`. En modo usuario `/proc/self/exe` es la copia `<base>-nrld-<pid>`, así que la derivación da `<base>-nrld-<pid>-bin` → `Exec failed with error: No such file or directory` (regresión Firefox moderno + ESR). Si existe el hermano `<base>-bin` (ELF) en el mismo dir, nrld ejecuta directamente ese binario real saltándose el launcher. Solo en modo usuario; en modo ROOT el launcher corre nativo y resuelve bien. |
+| `print_usage_help` | El `--help` (stdout, es salida pedida). |
 
 ### `appimages.c`
 
@@ -141,14 +175,11 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 | `get_squashfs_offset` | Escaneo **inverso** del magic `"hsqs"` (búsqueda del último squashfs embebido). |
 | `is_appimage` | `EI_ABIVERSION != 0` + squashfs presente. |
 | `name_is_so`, `dir_has_so` | Detección de `.so` (con versiones `.so.1.2.3`). |
-| `collect_libdirs_rec` | Recorre la raíz extraída (profundidad ≤3) y colecciona los dirs que contienen `.so` → `g_extra_libdirs`. |
+| `collect_libdirs_rec` | Recorre la raíz extraída (profundidad ≤3) y registra los dirs que contienen `.so` en el sysroot manager. |
 | `collect_qt_plugins_rec` | Busca el dir `platforms/` que contiene `.so` (plugin de plataforma Qt) → `QT_PLUGIN_PATH`. **Buffer local por llamada**: un buffer compartido rompía los hermanos tras una recursión profunda (no llegaba a `usr/bin`). |
-| `find_lib_under` / `find_lib_in_sysroot` | **Extralibfinder**: localiza un soname faltante recursivamente en subdirectorios no estándar del sysroot (`gvfs/`, `pulseaudio/`, `engines-3/`, `dri/`...) y registra el dir para `resolve_lib_path` + `--library-path`. Nunca mira musl `/usr/lib`. |
 | `find_elf_exec_in`, `find_internal_bin` | Descubre el binario interno del AppImage: **AppRun symlink→ELF** (OCAT) y **AppRun script `#!`** (se execa tal cual con `APPDIR`/`APPIMAGE`; el shell lanza el ELF real) son entradas canónicas. Un `AppRun` **ELF plano NO se prioriza** (launchers tipo OpenShot rompen al correr pelados: ncurses TUI + `.desktop`): se cae a `*.bin`, `usr/bin` y ELF top-level (nunca una `.so`). |
 | `extract_appimage` | `unsquashfs` del host (musl) hacia `/tmp/nrld-appimage-<pid>/` + recolección de dirs de libs. Antes de extraer, `sweep_stale_appimage_dirs` borra las extracciones viejas que ningún proceso vivo referencia (exe/cwd en `/proc/*`): cada AppImage deja ~600 MB, sin esto `/tmp` se llena. |
-| `append_lib_subdirs` | Monta la lista `:` de dirs internos + `g_extra_libdirs` para `LD_LIBRARY_PATH`. |
-| Vía `AppRun` script en `_start_main` | Cuando el binario interno es un script, nrld lo execa **directo** (sin loader/copia) con el env heredado + `APPDIR=<raiz>` + `APPIMAGE=<AppImage>`, igual que el runtime real. El script execa el ELF interno, que **re-entra a nrld** como interp de un binario normal ya extraído → modo usuario estándar (copia parcheada). Fix de AppImages tipo Heroic (antes se elegía la primera ELF top-level, p. ej. `libvulkan.so.1`, y se ejecutaba el loader con la `.so`). |
-| `launcher_bin_redirect` | Launcher estilo mozilla (`firefox`/`firefox-bin`, `thunderbird`...): el launcher es un ELF pequeño que deriva el binario real con `readlink("/proc/self/exe")` + `"-bin"`. En modo usuario `/proc/self/exe` es la copia `<base>-nrld-<pid>`, así que la derivación da `<base>-nrld-<pid>-bin` → `Exec failed with error: No such file or directory` (regresión Firefox moderno + ESR). Si existe el hermano `<base>-bin` (ELF) en el mismo dir, nrld ejecuta directamente ese binario real saltándose el launcher. Solo en modo usuario; en modo ROOT el launcher corre nativo y resuelve bien. |
+| Vía `AppRun` script en `executor.c` | Cuando el binario interno es un script, nrld lo execa **directo** (sin loader/copia) con el env heredado + `APPDIR=<raiz>` + `APPIMAGE=<AppImage>`, igual que el runtime real. El script execa el ELF interno, que **re-entra a nrld** como interp de un binario normal ya extraído → modo usuario estándar (copia parcheada). Fix de AppImages tipo Heroic (antes se elegía la primera ELF top-level, p. ej. `libvulkan.so.1`, y se ejecutaba el loader con la `.so`). |
 
 ### `proxy_readlink.c`
 
@@ -186,9 +217,10 @@ gcc -nostdlib -shared -fPIC -o libnrld-proxy.so \
     -I/usr/lib/glibc6/usr/include \
     proxy_readlink.c
 
-# 2. Fake loader (freestanding, sin libc)
+# 2. Fake loader (freestanding, sin libc) -- un TU por modulo
 gcc -nostdlib -static -ffreestanding -fno-stack-protector -O2 -s \
-    -o nrld nrld.c
+    -o nrld \
+    nrld.c utils.c elf_parser.c sysroot_manager.c appimages.c executor.c
 ```
 
 > `-I/usr/lib/glibc6/usr/include`: cabeceros glibc del sysroot (definen `Lmid_t`).
