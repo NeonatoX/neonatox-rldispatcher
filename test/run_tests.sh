@@ -1,14 +1,16 @@
 #!/bin/bash
 # E2E tests for nrld (neonatox-RLDispatcher).
-# Usage: run_tests.sh <nrld> <proxy> <srcdir>
+# Usage: run_tests.sh <nrld> <proxy> <srcdir> [nrld-lim2]
+#   nrld-lim2: nrld compilado con -DMAX_EXTRA_DIRS=2 (variante de meson,
+#   install:false). Sirve para el caso 8: agotar el limite de dirs extra.
 set -u
 
-if [ $# -ne 3 ]; then
-    echo "uso: $0 <nrld> <proxy> <srcdir>" >&2
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    echo "uso: $0 <nrld> <proxy> <srcdir> [nrld-lim2]" >&2
     exit 2
 fi
 
-NR="$1"; PROXY="$2"; SRCDIR="$3"
+NR="$1"; PROXY="$2"; SRCDIR="$3"; NR_LIM2="${4:-}"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "SKIP: python3 requerido para generar los probes"
@@ -104,6 +106,36 @@ FOO=bar NEONATOX_PROXY="$PROXY" "$NR" "$WORK/exec_keep" "$WORK/env_dump" >"$WORK
 grep -q '^FOO=bar$' "$WORK/keep.out" \
     || fail "7: el hijo glibc deberia conservar FOO=bar (env passthrough)"
 echo "ok 7: hijo glibc conserva el env (FOO=bar)"
+
+# --- 8. limite interno de dirs extra: agotado -> aviso DURO + lib faltante
+#     Regresion del bug real: resolve_lib_path devolvia 1 (guard "OK") sin
+#     registrar el dir donde vivia la lib, porque g_extra_libdirs ya estaba
+#     lleno. El loader en runtime no veia ese dir -> "cannot open shared
+#     object file". Con el fix, el guard avisa ("g_extra_libdirs lleno") y
+#     reporta la lib como faltante.
+#     need_multi necesita 3 libs en 3 subdirs NO estandar del sysroot
+#     (vdpau/, gvfs/, cairo/) -> 3 dirs extra distintos.
+if [ -n "$NR_LIM2" ] && [ -x "$NR_LIM2" ]; then
+    out=$(NEONATOX_STRICT_SYSROOT=1 NRLD_DEBUG=1 "$NR_LIM2" "$WORK/need_multi" 2>&1)
+    rc=$?
+    echo "$out" | grep -q "g_extra_libdirs lleno" \
+        || fail "8: deberia avisar '[ERROR] g_extra_libdirs lleno' al agotar el limite"
+    echo "$out" | grep -q "Falta la libreria glibc" \
+        || fail "8: la lib cuyo dir no se registro debe reportarse como faltante"
+    if echo "$out" | grep -q "Todas las NEEDED"; then
+        fail "8: el guard NO debe decir OK con el limite de dirs extra alcanzado"
+    fi
+    if [ "$rc" -eq 0 ]; then
+        fail "8: en modo estricto debe fallar (rc!=0) con el limite alcanzado"
+    fi
+    # Con el limite real (MAX_EXTRA_DIRS=64) los 3 dirs caben y la app corre.
+    if ! "$NR" "$WORK/need_multi" >/dev/null 2>&1; then
+        fail "8: con MAX_EXTRA_DIRS=64 need_multi deberia correr rc=0"
+    fi
+    echo "ok 8: limite agotado -> [ERROR] g_extra_libdirs lleno + lib faltante; con limite 64 corre rc=0"
+else
+    echo "SKIP 8: falta el nrld con MAX_EXTRA_DIRS=2 (4to argumento)"
+fi
 
 echo "TODOS LOS TESTS OK"
 exit 0

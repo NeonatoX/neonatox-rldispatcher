@@ -430,10 +430,140 @@ def build(path, soname):
     return path
 
 
+def build_multi(path, sonames):
+    """ELF64 ET_EXEC con PT_INTERP y VARIOS DT_NEEDED (en orden).
+
+    El orden de los DT_NEEDED importa: nrld los resuelve en ese orden, y cada
+    uno que solo exista en un subdir NO estandar del sysroot consume una
+    entrada del array de "dirs extra" de librerias (MAX_EXTRA_DIRS). Con
+    MAX_EXTRA_DIRS=2 y 3 subdirs distintos, el tercero no cabe -> el guard
+    debe avisar ("g_extra_libdirs lleno") y reportar la lib como faltante.
+
+    Layout propio (calculado) para no tocar el de build() (probes historicos).
+    """
+    base = 0x400000
+
+    def align8(x):
+        return (x + 7) & ~7
+
+    ehdr_off = 0x00
+    phdr_off = 0x40
+    interp_off = 0x100
+
+    interp = b"/lib64/ld-linux-x86-64.so.2\0"
+
+    # dynstr: "\0" + nombres separados por "\0"; el offset de cada nombre es
+    # el valor de su DT_NEEDED.
+    dynstr = b"\0"
+    needed_offs = []
+    for sn in sonames:
+        needed_offs.append(len(dynstr))
+        dynstr += sn.encode() + b"\0"
+
+    dynsym = bytes(24)                       # sym0 NULL
+    syhash = struct.pack("<IIII", 1, 1, 0, 0)
+
+    # El tamano del DYNAMIC no depende de sus valores (todas las entradas son
+    # de 16 B), asi que el layout se puede calcular antes de construirlo.
+    dyn_size = (len(needed_offs) + 5) * 16
+
+    off = 0x140
+    dynstr_off = off; off = align8(off + len(dynstr))
+    dyn_off = off;    off = align8(off + dyn_size)
+    dynsym_off = off; off = align8(off + len(dynsym))
+    syhash_off = off; off = align8(off + len(syhash))
+    code_off = off
+
+    # DYNAMIC: N DT_NEEDED (en orden) + STRTAB + STRSZ + SYMTAB + HASH + NULL.
+    # Cada entrada es un par (tag, valor) de 8+8 bytes.
+    entries = []
+    for noff in needed_offs:
+        entries.append(struct.pack("<qq", 1, noff))             # DT_NEEDED
+    entries += [
+        struct.pack("<qq", 5, base + dynstr_off),             # DT_STRTAB
+        struct.pack("<qq", 10, len(dynstr)),                  # DT_STRSZ
+        struct.pack("<qq", 6, base + dynsym_off),             # DT_SYMTAB
+        struct.pack("<qq", 4, base + syhash_off),             # DT_HASH
+        struct.pack("<qq", 0, 0),                             # DT_NULL
+    ]
+    dyn = b"".join(entries)
+
+    # mov $60,%eax; xor %edi,%edi; syscall   -> exit(0)
+    code = bytes([0xb8, 0x3c, 0x00, 0x00, 0x00,
+                  0x31, 0xff,
+                  0x0f, 0x05])
+
+    total = code_off + len(code)
+
+    e_ident = bytes([
+        0x7f, 0x45, 0x4c, 0x46,  # ELF
+        0x02, 0x01, 0x01, 0x00,  # 64-bit, LE, version 1, SysV ABI
+        0x00, 0x00, 0x00, 0x00,  # EI_PAD: el loader glibc rechaza
+        0x00, 0x00, 0x00, 0x00,  # e_ident con padding != 0
+    ])
+    ehdr = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        e_ident,
+        2,                 # e_type: ET_EXEC
+        62,                # e_machine: x86-64
+        1,                 # e_version
+        base + code_off,   # e_entry
+        phdr_off,          # e_phoff
+        0, 0,              # e_shoff, e_flags
+        64,                # e_ehsize
+        56,                # e_phentsize
+        3,                 # e_phnum
+        0, 0, 0)           # e_shentsize, e_shnum, e_shstrndx
+
+    def phdr(ptype, pflags, poff, pvaddr, psize, palign):
+        return struct.pack("<IIQQQQQQ", ptype, pflags,
+                           poff, pvaddr, pvaddr, psize, psize, palign)
+
+    phdrs = b"".join([
+        phdr(1, 7, 0, base, total, 0x1000),                       # PT_LOAD RWX
+        phdr(3, 4, interp_off, base + interp_off, len(interp), 1),  # PT_INTERP
+        phdr(2, 6, dyn_off, base + dyn_off, len(dyn), 8),         # PT_DYNAMIC
+    ])
+
+    blob = bytearray(total)
+    blob[ehdr_off:ehdr_off + len(ehdr)] = ehdr
+    blob[phdr_off:phdr_off + len(phdrs)] = phdrs
+    p = interp_off
+    blob[p:p + len(interp)] = interp
+    p = dynstr_off
+    blob[p:p + len(dynstr)] = dynstr
+    p = dyn_off
+    blob[p:p + len(dyn)] = dyn
+    p = dynsym_off
+    blob[p:p + len(dynsym)] = dynsym
+    p = syhash_off
+    blob[p:p + len(syhash)] = syhash
+    p = code_off
+    blob[p:p + len(code)] = code
+
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    os.chmod(path, 0o755)
+    return path
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "."
     build("%s/need_vdpau" % outdir, "libvdpau_trace.so.1")
     build("%s/need_missing" % outdir, "libnrld-missing-probe.so.1")
+    # need_multi: 3 libs que solo existen en subdirs NO estandar del sysroot
+    # (vdpau/, gvfs/, cairo/) -> 3 dirs extra distintos. Con el limite real
+    # (MAX_EXTRA_DIRS=64) los 3 se registran y la app corre; con el limite a 2
+    # (build nrld-lim2) el tercero no cabe -> el guard debe avisar.
+    # Los 3 nombres son UNICOS en el sysroot (el extralibfinder encuentra
+    # siempre el subdir previsto) y las libs cargan limpias (sin simbolos
+    # indefinidos: son modulos autonomos, no plugins de otra app).
+    build_multi("%s/need_multi" % outdir, [
+        "libc.so.6",
+        "libvdpau_trace.so.1",   # sysroot/usr/lib/vdpau
+        "libgvfscommon.so",      # sysroot/usr/lib/gvfs
+        "libcairo-fdr.so",       # sysroot/usr/lib/cairo
+    ])
     glinterp = "/lib64/ld-linux-x86-64.so.2"
     build_simple("%s/exec_scrub" % outdir, glinterp, payload_exec_scrub(),
                  needed="libc.so.6", funcs=["execve"])

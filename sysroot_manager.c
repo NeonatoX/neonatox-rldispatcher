@@ -51,12 +51,40 @@ static int  g_conf_log_level = 0;
 static char g_extra_libdirs[MAX_EXTRA_DIRS][4096];
 static int  g_extra_libdirs_n = 0;
 
+/* El limite de dirs extra se alcanzo alguna vez (el aviso [ERROR] se
+   imprime una sola vez). */
+static int  g_extra_full_reported = 0;
+/* El ultimo fallo de resolve_lib_path fue por limite de dirs extra (para
+   poder explicar el "Falta la libreria glibc" con la causa correcta). */
+static int  g_resolve_failed_full = 0;
+/* El buffer de rutas de librerias se trunco (aviso unico). */
+static int  g_libpath_trunc_reported = 0;
+
+/* Convierte un literal de macro en string (para imprimir el limite). */
+#define NR_STR2(x) #x
+#define NR_STR(x)  NR_STR2(x)
+
 /* Copias parcheadas de DT_NEEDED absolutos en /tmp/nrld-patch-<pid>. */
 static char g_patch_dir[4096];
 static int  g_patch_dir_set = 0;
 static char g_shadow_paths[MAX_SHADOW][4096];
 static int  g_shadow_n = 0;
 static char g_top_patch[4096];
+
+/* Avisa (UNA sola vez por ejecucion) que el array de dirs extra esta lleno.
+   `what` describe lo que se ha quedado sin registrar. Es un error DURO
+   (print_err): si un dir de libs no se registra, el loader en runtime no lo
+   ve, aunque el guard lo de por bueno. */
+void sysroot_extra_libdirs_full_warn(const char *what) {
+    if (g_extra_full_reported) return;
+    g_extra_full_reported = 1;
+    print_flush();
+    print_err("[ERROR] g_extra_libdirs lleno (limite interno MAX_EXTRA_DIRS=");
+    print_err(NR_STR(MAX_EXTRA_DIRS));
+    print_err("): no se puede registrar ");
+    print_err(what);
+    print_err("\n");
+}
 
 /* ------------------------------------------------------------------ */
 /*  Configuracion (/etc/nrld.conf)                                      */
@@ -134,6 +162,8 @@ void sysroot_reset_extra_libdirs(void) {
 
 void sysroot_add_extra_libdir(const char *dir) {
     if (g_extra_libdirs_n >= MAX_EXTRA_DIRS) return;
+    unsigned long len = my_strlen(dir);
+    if (len + 1 > sizeof(g_extra_libdirs[0])) return;  /* path demasiado largo */
     my_strcpy(g_extra_libdirs[g_extra_libdirs_n], dir);
     g_extra_libdirs_n++;
 }
@@ -152,8 +182,10 @@ int         sysroot_patch_dir_set(void) { return g_patch_dir_set; }
 const char *sysroot_top_patch(void)     { return g_top_patch; }
 
 /* Append the internal lib dirs of `root` (standard subdirs that exist +
-   the collected extra lib dirs) to a ':'-separated path buffer. */
-void append_lib_subdirs(char *buf, const char *root) {
+   the collected extra lib dirs) to a ':'-separated path buffer. `bufsz` acota
+   el buffer: al llenarse se deja de anadir (nunca desborda) y se avisa, porque
+   un dir fuera del LD_LIBRARY_PATH es un dir que el loader no vera. */
+int append_lib_subdirs(char *buf, unsigned long bufsz, const char *root) {
     static const char *subs[] = {
         "/bin", "/usr/bin", "/bin/lib", "/bin/lib64", "/usr/bin/lib64", "/usr/bin/lib",
         "/lib", "/lib64", "/usr/lib", "/usr/lib64",
@@ -163,13 +195,28 @@ void append_lib_subdirs(char *buf, const char *root) {
     for (unsigned int i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         my_strcpy(d, root); my_strcat(d, subs[i]);
         if (!file_exists(d)) continue;
-        my_strcat(buf, ":");
-        my_strcat(buf, d);
+        if (!my_cat_bounded(buf, bufsz, ":") ||
+            !my_cat_bounded(buf, bufsz, d)) {
+            if (!g_libpath_trunc_reported) {
+                g_libpath_trunc_reported = 1;
+                print_flush();
+                print_err("[ERROR] buffer de rutas de librerias lleno: se truncan dirs (limite interno)\n");
+            }
+            return 0;
+        }
     }
     for (int i = 0; i < g_extra_libdirs_n; i++) {
-        my_strcat(buf, ":");
-        my_strcat(buf, g_extra_libdirs[i]);
+        if (!my_cat_bounded(buf, bufsz, ":") ||
+            !my_cat_bounded(buf, bufsz, g_extra_libdirs[i])) {
+            if (!g_libpath_trunc_reported) {
+                g_libpath_trunc_reported = 1;
+                print_flush();
+                print_err("[ERROR] buffer de rutas de librerias lleno: se truncan dirs (limite interno)\n");
+            }
+            return 0;
+        }
     }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -242,6 +289,7 @@ int resolve_lib_path(const char *soname, const char *lib_root, char *out) {
         "/lib", "/lib64", "/usr/lib", "/usr/lib64",
         "/usr/lib/x86_64-linux-gnu", "/usr/lib/i386-linux-gnu"
     };
+    g_resolve_failed_full = 0;
     for (unsigned int i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         my_strcpy(out, lib_root); my_strcat(out, subs[i]);
         my_strcat(out, "/"); my_strcat(out, soname);
@@ -267,7 +315,30 @@ int resolve_lib_path(const char *soname, const char *lib_root, char *out) {
             int already = 0;
             for (int e = 0; e < g_extra_libdirs_n; e++)
                 if (my_strcmp(g_extra_libdirs[e], extra_dir) == 0) { already = 1; break; }
-            if (!already) sysroot_add_extra_libdir(extra_dir);
+            if (!already) {
+                /* El dir donde vive la lib debe quedar REGISTRADO: es lo que
+                   lo mete en el LD_LIBRARY_PATH / --library-path del loader.
+                   Si el array de dirs extra esta LLENO no se puede registrar:
+                   entonces el guard NO puede dar la lib por buena (el loader
+                   en runtime no la encontraria y cairia en /usr/lib musl), asi
+                   que se devuelve 0 y la lib se reporta como faltante. */
+                if (g_extra_libdirs_n >= MAX_EXTRA_DIRS) {
+                    /* Mensaje acotado: `what` se construye con concat
+                       limitada (un path largo + el soname no deben desbordar
+                       el buffer). */
+                    char what[4600];
+                    what[0] = '\0';
+                    my_cat_bounded(what, sizeof(what), extra_dir);
+                    my_cat_bounded(what, sizeof(what), " (libreria ");
+                    my_cat_bounded(what, sizeof(what), soname);
+                    my_cat_bounded(what, sizeof(what), "; se reportara como faltante)");
+                    sysroot_extra_libdirs_full_warn(what);
+                    g_resolve_failed_full = 1;
+                    out[0] = '\0';
+                    return 0;
+                }
+                sysroot_add_extra_libdir(extra_dir);
+            }
             my_strcpy(out, extra_dir);
             my_strcat(out, "/");
             my_strcat(out, soname);
@@ -451,6 +522,8 @@ static int scan_missing_libs(const char *top_path, const char *bin_dir) {
                 print_msg("[ADV] Falta la libreria glibc: ");
                 print_msg(soname);
                 if (is_abs) print_msg(" (NEEDED absoluto no resoluble)\n");
+                else if (g_resolve_failed_full)
+                    print_msg(" (limite interno de dirs extra alcanzado: su dir no se pudo registrar)\n");
                 else        print_msg(" (caeria a /usr/lib como musl)\n");
                 continue;
             }

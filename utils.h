@@ -73,6 +73,9 @@ int   my_starts_with(const char *str, const char *prefix);
 void  my_strcpy(char *dst, const char *src);
 void  my_strcat(char *dst, const char *src);
 int   my_strcmp(const char *a, const char *b);
+/* Concatena `src` a `dst` SOLO si cabe (contando el '\0' final). Devuelve 1
+   si se concateno, 0 si no cabia (dst queda intacto): evita desbordes. */
+int   my_cat_bounded(char *dst, unsigned long dstsz, const char *src);
 
 /* logging por niveles (Investigacion_05: siempre a stderr) */
 #define LOG_OFF   0   /* solo [ERROR]                    */
@@ -87,6 +90,7 @@ extern unsigned g_log_len;
 void print_msg(const char *msg);   /* diagnostico -> stderr, filtrado por nivel */
 void print_out(const char *msg);   /* salida del usuario (--help) -> stdout */
 void print_err(const char *msg);   /* errores duros -> stderr, siempre visible */
+void print_flush(void);            /* vacia el buffer de print_msg pendiente */
 
 /* helpers de fichero */
 int  file_exists(const char *path);

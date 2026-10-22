@@ -68,6 +68,14 @@ void my_strcat(char *dst, const char *src) {
     *dst = '\0';
 }
 
+int my_cat_bounded(char *dst, unsigned long dstsz, const char *src) {
+    unsigned long len = my_strlen(dst);
+    unsigned long slen = my_strlen(src);
+    if (len + slen + 1 > dstsz) return 0;
+    my_strcat(dst, src);
+    return 1;
+}
+
 int my_strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
@@ -126,6 +134,12 @@ void print_out(const char *msg) {
 /* Errores duros: SIEMPRE a stderr, sin importar el nivel de log. */
 void print_err(const char *msg) {
     syscall3(SYS_write, 2, (long)msg, my_strlen(msg));
+}
+
+/* Vacia el buffer de diagnostico pendiente. Se llama antes de escribir con
+   print_err para que una linea a medias no se mezcle con el error duro. */
+void print_flush(void) {
+    log_flush();
 }
 
 int file_exists(const char *path) {

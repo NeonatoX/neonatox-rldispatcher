@@ -144,7 +144,22 @@ static void collect_libdirs_rec(const char *dir, int depth) {
                 my_strcpy(scan_path_buf, dir);
                 my_strcat(scan_path_buf, "/");
                 my_strcat(scan_path_buf, nm);
-                if (dir_has_so(scan_path_buf)) sysroot_add_extra_libdir(scan_path_buf);
+                if (dir_has_so(scan_path_buf)) {
+                    /* Si el array de dirs extra esta lleno, este dir NO se
+                       registra: el loader en runtime no lo veria aunque el
+                       guard lo diese por bueno. Se avisa (mismo error que el
+                       extralibfinder) y se deja de collectar. */
+                    if (sysroot_extra_libdir_count() >= MAX_EXTRA_DIRS) {
+                        char what[4300];
+                        what[0] = '\0';
+                        my_cat_bounded(what, sizeof(what), scan_path_buf);
+                        my_cat_bounded(what, sizeof(what), " (libs internas del AppImage)");
+                        sysroot_extra_libdirs_full_warn(what);
+                        syscall1(SYS_close, fd);
+                        return;
+                    }
+                    sysroot_add_extra_libdir(scan_path_buf);
+                }
                 collect_libdirs_rec(scan_path_buf, depth + 1);
             }
             off += de->d_reclen;

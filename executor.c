@@ -34,10 +34,13 @@ typedef struct { long a_type; long a_val; } Elf64_auxv_t;
 #define AT_NULL    0
 #define AT_EXECFN  31
 
-/* Buffers de variables de entorno que se inyectan al hijo. */
-static char g_new_ld_path[16384];
+/* Buffers de variables de entorno que se inyectan al hijo.
+   g_new_ld_path / g_lib_paths acogen el LD_LIBRARY_PATH y el --library-path:
+   con MAX_EXTRA_DIRS=64 dirs extra (cada uno hasta 4096 B) no caben en 16 KB,
+   asi que van a 64 KB (por debajo de MAX_ARG_STRLEN = 128 KB del kernel). */
+static char g_new_ld_path[65536];
 static char g_gconv[256];
-static char g_lib_paths[16384];
+static char g_lib_paths[65536];
 static char g_real_exe[4096];
 static char g_ld_preload[512];
 static char g_sysroot_env[512];
@@ -526,7 +529,7 @@ void nrld_main(long *sp) {
         my_strcat(g_new_ld_path, ":");
     }
     my_strcat(g_new_ld_path, lib_root);
-    append_lib_subdirs(g_new_ld_path, lib_root);
+    append_lib_subdirs(g_new_ld_path, sizeof(g_new_ld_path), lib_root);
     my_strcat(g_new_ld_path, ":");
     my_strcat(g_new_ld_path, sysroot_conf_libpath()[0] ? sysroot_conf_libpath() : SYSROOT_LIBS);
     if (existing_ld_path) {
@@ -543,7 +546,7 @@ void nrld_main(long *sp) {
         my_strcat(g_lib_paths, ":");
     }
     my_strcat(g_lib_paths, lib_root);
-    append_lib_subdirs(g_lib_paths, lib_root);
+    append_lib_subdirs(g_lib_paths, sizeof(g_lib_paths), lib_root);
     my_strcat(g_lib_paths, ":");
     my_strcat(g_lib_paths, sysroot_conf_libpath()[0] ? sysroot_conf_libpath() : SYSROOT_LIBS);
 

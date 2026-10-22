@@ -22,19 +22,19 @@ entorno musl del host (sin mezclar dos libcs en un mismo proceso).
 | Archivo | Líneas | Rol |
 |---|---|---|
 | `nrld.c` | 36 | Punto de entrada: solo el stub de entrada `_start` (asm) que pasa el stack al `executor`. |
-| `executor.c` / `.h` | 762 | Flujo principal: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual vs directo, guard no-ELF, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_*`, sanitización de `LD_*`, **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (copia parcheada → loader glibc **in-process**), watchdog y limpieza de residuos, `--help`. |
-| `utils.c` / `.h` | 212 | Runtime freestanding compartido: syscalls crudos `syscall0..4`, strings (`my_strlen/cpy/cat/cmp`), log por niveles a stderr (`print_msg`/`print_out`/`print_err`), helpers de fichero/ruta (`file_exists`, `uint_to_str`, `read_at`, `resolve_path`, `get_directory`, `can_write_dir`) y `rm_rf`. |
+| `executor.c` / `.h` | 784 | Flujo principal: `argc/argv/envp/auxv`, `AT_EXECFN`, modo manual vs directo, guard no-ELF, build de `LD_LIBRARY_PATH`/`LD_PRELOAD`/`QT_PLUGIN_PATH`/`NEONATOX_*`, sanitización de `LD_*`, **modo raíz** (fork + swap de symlinks de `/lib64`) vs **modo usuario** (copia parcheada → loader glibc **in-process**), watchdog y limpieza de residuos, `--help`. |
+| `utils.c` / `.h` | 225 | Runtime freestanding compartido: syscalls crudos `syscall0..4`, strings (`my_strlen/cpy/cat/cmp`), log por niveles a stderr (`print_msg`/`print_out`/`print_err`/`print_flush`), helpers de fichero/ruta (`file_exists`, `uint_to_str`, `read_at`, `resolve_path`, `get_directory`, `can_write_dir`) y `rm_rf`. |
 | `elf_parser.c` / `.h` | 412 | Solo **formato ELF**: `e_ident`, `DT_NEEDED` (`PT_DYNAMIC`/`PT_LOAD`, vaddr→offset), el parche de `EI_ABIVERSION` (AppImage/type-2) y la copia con `PT_INTERP` reescrito al loader real (con self-sweep de copias viejas). |
-| `sysroot_manager.c` / `.h` | 471 | Política de aislamiento musl↔glibc: resolución de sonames (dir del binario + subdirs estándar + dirs extra + sysroot, con fallback **extralibfinder**), guard **transitivo** de `DT_NEEDED`, copias parcheadas de NEEDED absolutos (`shadow`), lectura de `/etc/nrld.conf` y registro de directorios extra de librerías. |
-| `appimages.c` / `.h` | 419 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el barrido de extracciones viejas. |
+| `sysroot_manager.c` / `.h` | 565 | Política de aislamiento musl↔glibc: resolución de sonames (dir del binario + subdirs estándar + dirs extra + sysroot, con fallback **extralibfinder**), guard **transitivo** de `DT_NEEDED` (incluido el **límite interno de dirs extra**), copias parcheadas de NEEDED absolutos (`shadow`), lectura de `/etc/nrld.conf` y registro de directorios extra de librerías. |
+| `appimages.c` / `.h` | 450 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el barrido de extracciones viejas. |
 | `nrld_paths.h` | 26 | Constantes de compilación compartidas: `NEO_SYSROOT`/`NEO_BINDIR` (overridables con `-D`), loader real, ruta del interp, dirs del sysroot, `GCONV_DIR`, proxy. |
 | `proxy_readlink.c` | 937 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + cache de veredictos + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
-| `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y el test E2E. |
+| `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared), la variante de test `nrld-lim2` (`-DMAX_EXTRA_DIRS=2`, `install:false`), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y el test E2E. |
 | `nrld.conf` | 16 | Plantilla de `/etc/nrld.conf` (host): `key = value` — `library_path` (LD_LIBRARY_PATH), `proxy` (LD_PRELOAD) y la clave `strict` (modo estricto global). |
 | `nrld-profile.sh` | 29 | Plantilla de `/etc/profile.d/nrld-profile.sh`: exporta `LD_PRELOAD` **condicionalmente** si el proxy existe en el filesystem (evita errores en chroot) y `NEONATOX_SYSROOT`; **no** exporta `LD_LIBRARY_PATH` (se inyecta por nrld). Sirve para que las pestañas de Firefox/Brave hereden el proxy (ver **Uso**). |
 | `scripts/post-install.sh` | 20 | Refresca el cache `ldconfig` del sysroot glibc (`-n` con los dirs del sysroot); no fatal, salta con `DESTDIR`. |
-| `test/gen_probes.py` | 134 | Genera ELF64 x86-64 mínimos de prueba (struct-only, sin toolchain glibc): `need_vdpau` (NEEDED `libvdpau_trace.so.1`) y `need_missing` (NEEDED inexistente). |
-| `test/run_tests.sh` | 61 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl, **canal stdout limpio** (regresión de Investigación 05: nrld no escribe nada por defecto y el diagnóstico con `NRLD_DEBUG=3` va a stderr). |
+| `test/gen_probes.py` | 578 | Genera ELF64 x86-64 mínimos de prueba (struct-only, sin toolchain glibc): `need_vdpau` (NEEDED `libvdpau_trace.so.1`), `need_missing` (NEEDED inexistente) y `need_multi` (varios DT_NEEDED: `libc.so.6` + 3 libs que solo viven en subdirs no estándar del sysroot — `vdpau/`, `gvfs/`, `cairo/` — para forzar 3 dirs extra distintos). |
+| `test/run_tests.sh` | 140 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl, **canal stdout limpio** (regresión de Investigación 05: nrld no escribe nada por defecto y el diagnóstico con `NRLD_DEBUG=3` va a stderr) y **límite interno de dirs extra** (con `nrld-lim2`: aviso duro + lib reportada como faltante; con el límite real: rc=0). |
 | `README.md` | — | Este documento. |
 | `AGENTS.md` | — | Notas técnicas de la aislación musl↔glibc (restricciones, comportamientos conocidos). |
 
@@ -152,12 +152,12 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 
 | Sección | Qué resuelve |
 |---|---|
-| `resolve_lib_path` | Soname → ruta: dir del binario + subdirs estándar + `g_extra_libdirs` + sysroot; con fallback **extralibfinder**. |
+| `resolve_lib_path` | Soname → ruta: dir del binario + subdirs estándar + `g_extra_libdirs` + sysroot; con fallback **extralibfinder**. Si el dir donde vive la lib no cabe en el array de dirs extra (`MAX_EXTRA_DIRS`, 64) **no devuelve la ruta**: avisa (`[ERROR] g_extra_libdirs lleno`) y la lib se reporta como **faltante** (el loader en runtime no la vería: mejor fallar limpio que mentir con un `[OK]`). |
 | `find_lib_under` / `find_lib_in_sysroot` | **Extralibfinder**: localiza un soname faltante recursivamente en subdirectorios no estándar del sysroot (`gvfs/`, `pulseaudio/`, `engines-3/`, `dri/`...) y registra el dir para `resolve_lib_path` + `--library-path`. Nunca mira musl `/usr/lib`. |
 | `create_shadow_copy` | `DT_NEEDED` con **ruta absoluta** (e.g. `libxul.so`): el loader ignora el path pero pierde la lib; se traduce a soname en una copia parcheada que `--library-path` sí resuelve. |
 | `scan_missing_libs` / `check_needed_libs` | Guard **transitivo** de cobertura NEEDED (BFS con visited, ciclo/dedup acotado a 512): recorre los `DT_NEEDED` de cada lib que resuelve dentro del sysroot. |
 | `sysroot_load_conf` | Lee `/etc/nrld.conf` (host, lo escribe el instalador) por raw syscalls: `library_path`/`proxy` (overrides de LD_LIBRARY_PATH/LD_PRELOAD), token `strict` → todas las apps estrictas sin prefijo env, y `log_level` (nivel de log global, sustituible por `NRLD_DEBUG` por proceso). |
-| `sysroot_*_extra_libdir*`, `append_lib_subdirs` | Registro de directorios extra de librerías (AppImage interno, subdirs no estándar) y montaje de la lista `:` para `LD_LIBRARY_PATH`. |
+| `sysroot_*_extra_libdir*`, `append_lib_subdirs` | Registro de directorios extra de librerías (AppImage interno, subdirs no estándar) y montaje de la lista `:` para `LD_LIBRARY_PATH`. `append_lib_subdirs` es **acotado** (`bufsz`): si el buffer se llena avisa y deja de añadir (nunca desborda; un dir fuera del `LD_LIBRARY_PATH` es un dir que el loader no ve). |
 
 ### `executor.c`
 
@@ -227,6 +227,11 @@ gcc -nostdlib -static -ffreestanding -fno-stack-protector -O2 -s \
 > (En el build meson, `NEO_SYSROOT`/`NEO_BINDIR` se pasan con `-D`; en la receta
 > manual valen sus defaults `-DNEO_SYSROOT="/usr/lib/glibc6"`,
 > `-DNEO_BINDIR="/usr/lib/neonatox"`.)
+> El build meson genera además `nrld-lim2` (el mismo binario con
+> `-DMAX_EXTRA_DIRS=2`, `install:false`): es solo para el E2E, que lo usa para
+> ejercitar el guard de "g_extra_libdirs lleno" (ver `test/run_tests.sh`, caso 8).
+> En la receta manual se obtiene igual con
+> `-DMAX_EXTRA_DIRS=2` (el header lo pisa con un `#ifndef`).
 > `-nostdlib` en el proxy: si se enlazara con el `gcc` musl del host emitiría
 > `NEEDED [libc.so]` (soname musl) → "invalid ELF header" en el loader glibc.
 > El proxy debe compilarse **sin** libc del host y con `-fno-stack-protector`
@@ -362,6 +367,15 @@ los binarios musl del host (ver `test/run_tests.sh`, caso 4).
 - **Extralibfinder** validado E2E: un ELF con `NEEDED libvdpau_trace.so.1` (que solo existe en
   `/usr/lib/glibc6/usr/lib/vdpau/`) se resuelve en strict (`[OK]`) y el dir del subdir entra en
   `LD_LIBRARY_PATH` → la app corre (rc=0).
+- **Límite interno de dirs extra (`MAX_EXTRA_DIRS`, 64)**: el extralibfinder registraba el dir
+  donde vivía la lib solo si cabía en `g_extra_libdirs`; si el array estaba lleno lo descartaba
+  **en silencio** y devolvía "resuelta" → el guard decía `[OK]` y el loader en runtime no
+  encontraba la lib (`cannot open shared object file`). Ahora `resolve_lib_path` **no devuelve
+  la ruta** si no puede registrar el dir: avisa `[ERROR] g_extra_libdirs lleno` y la lib se
+  reporta como **faltante** (en strict → `Sysroot glibc incompleto`, rc=1). El mismo aviso se
+  emite en el scan de libs internas de AppImage, y `append_lib_subdirs`/`LD_LIBRARY_PATH` son
+  **acotados** (64 KB) para que un desbordamiento no recorte rutas en silencio.
+  E2E: caso 8 de `test/run_tests.sh` (variante `nrld-lim2` con el límite a 2).
 - **OpenShot 4.0.0** (AppImage): arranca completo bajo Xvfb con strict (Qt `xcb` cargado vía
   `QT_PLUGIN_PATH`, sin `[neonatox] Falta`). El plugin Qt se detectó tras arreglar el buffer
   compartido del scan recursivo.

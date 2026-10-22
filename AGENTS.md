@@ -48,7 +48,7 @@ utils  <-  elf_parser  <-  sysroot_manager  <-  appimages  <-  executor  <-  nrl
 | `nrld.c` | Solo el stub de entrada `_start` (asm) que pasa el stack a `nrld_main()`. |
 | `utils.c/.h` | Runtime freestanding: syscalls crudos `syscall0..4`, strings, log por niveles a stderr, helpers de fichero/ruta, `rm_rf`. |
 | `elf_parser.c/.h` | Solo formato ELF: `is_elf`, `read_eident`, `get_needed_names`, `maybe_patch_abi_version`, `make_interp_patched_copy` (+ sweep de copias). |
-| `sysroot_manager.c/.h` | Política musl<->glibc: `resolve_lib_path`, extralibfinder (`find_lib_under`/`find_lib_in_sysroot`), `create_shadow_copy`, guard transitivo (`scan_missing_libs`/`check_needed_libs`), `/etc/nrld.conf` (`sysroot_load_conf`), dirs extra de libs. |
+| `sysroot_manager.c/.h` | Política musl<->glibc: `resolve_lib_path`, extralibfinder (`find_lib_under`/`find_lib_in_sysroot`), `create_shadow_copy`, guard transitivo (`scan_missing_libs`/`check_needed_libs`), `/etc/nrld.conf` (`sysroot_load_conf`), dirs extra de libs (array `g_extra_libdirs`, tope `MAX_EXTRA_DIRS`=64). |
 | `appimages.c/.h` | AppImage type-2: extracción squashfs, binario interno, walkers de libs internas y plugin Qt. |
 | `executor.c/.h` | Flujo principal: env/auxv, modo root vs usuario, watchdog, `launcher_bin_redirect`, `cleanup_run_residue`, `--help`. |
 | `nrld_paths.h` | Constantes de compilación compartidas (`NEO_SYSROOT`, `NEO_BINDIR`, loader real, dirs del sysroot, `GCONV_DIR`, proxy). |
@@ -139,4 +139,16 @@ Firefox's GTK/ICU/Pango come via **runtime `dlopen`** of `libxul.so`, not static
 ### Transitive NEEDED guard (nrld)
 
 The pre-flight guard was widened from the top binary's direct `DT_NEEDED` to a **transitive closure** (`scan_missing_libs` in `sysroot_manager.c`): it walks the dependency tree, and for every library that resolves inside the sysroot it also inspects that library's own `DT_NEEDED`, so a musl-only dependency hidden one level down is reported. Covers apps whose whole dep tree is statically linked (most standalone binaries / AppImages). It does NOT cover `dlopen`'d trees (Firefox's `libxul`) — that's the proxy link-map scan's job. Cycle/dedup via a visited soname set (depth-bounded at 512).
+
+### Internal limit of extra lib dirs (`MAX_EXTRA_DIRS`, fix of the silent drop)
+
+**Bug (fixed):** the extralibfinder resolves a soname that only lives in a non-standard sysroot subdir (`vdpau/`, `gvfs/`, `cairo/`, ...) and must register that dir in `g_extra_libdirs` so the runtime loader sees it (`LD_LIBRARY_PATH` / `--library-path`). `sysroot_add_extra_libdir()` used to **silently drop** the dir when the array was full and `resolve_lib_path()` still returned 1 → the guard printed `[OK] Todas las NEEDED...` while the loader in runtime failed with `cannot open shared object file` (the exact "guard says OK but the lib is invisible" class of bug this repo keeps hitting).
+
+**Fix (`sysroot_manager.c`):**
+- `resolve_lib_path()`: if the dir **cannot** be registered (`g_extra_libdirs_n >= MAX_EXTRA_DIRS`), it does **not** return the path — it emits a hard error (`[ERROR] g_extra_libdirs lleno (limite interno MAX_EXTRA_DIRS=N): no se puede registrar <dir> (libreria <soname>; se reportara como faltante)`, once per run via `sysroot_extra_libdirs_full_warn()`) and returns 0 → the guard reports the lib as **missing** (`[ADV] Falta la libreria glibc: <soname> (limite interno de dirs extra alcanzado: su dir no se pudo registrar)`) → in strict mode the run fails cleanly with "Sysroot glibc incompleto" (rc=1) instead of lying with `[OK]`.
+- `MAX_EXTRA_DIRS` raised 16 → **64** and made overridable at compile time (`#ifndef MAX_EXTRA_DIRS` in `sysroot_manager.h`) so the E2E can build a `-DMAX_EXTRA_DIRS=2` variant.
+- Same warning in the AppImage internal-libs scan (`appimages.c`): a dir that would not be registered stops the scan **with the error**, not silently.
+- Hardening: `sysroot_add_extra_libdir()` and `append_lib_subdirs()` are now **bounded** (path copy ≤4096 B; the `LD_LIBRARY_PATH` buffers are 64 KB, `MAX_ARG_STRLEN`=128 KB). If a buffer would overflow, nrld stops appending and prints `[ERROR] buffer de rutas de librerias lleno...` — a truncated `LD_LIBRARY_PATH` is the same class of bug (a dir the loader will not see), so it must never be silent.
+
+**E2E (permanent regression case):** `test/run_tests.sh` case 8 uses the probe `need_multi` (`test/gen_probes.py`, `build_multi()`): 4 `DT_NEEDED` — `libc.so.6` + `libvdpau_trace.so.1` (`vdpau/`), `libgvfscommon.so` (`gvfs/`), `libcairo-fdr.so` (`cairo/`) → **3 distinct extra dirs**. With `nrld-lim2` (limit 2) the third does not fit → the case asserts the hard error + the missing-lib report + **no** `[OK] Todas las NEEDED` + rc≠0 in strict mode; with the real limit (64) the same probe must run rc=0. `meson` builds `nrld-lim2` as a second target (`install: false`) and passes it to the E2E as the optional 4th argument (the case is SKIPped if absent).
 
