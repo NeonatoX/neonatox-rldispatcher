@@ -54,6 +54,13 @@ proxy = shared_library('nrld-proxy',
     sources: 'proxy_readlink.c',
     c_args: [
         '-I' + glibc_incs,
+        # El estado del scan strict (found_bad/bad_path/verdict_cache) es TLS
+        # por hilo. initial-exec -> acceso directo (sin __tls_get_addr): el
+        # proxy es siempre LD_PRELOAD, asi que su bloque TLS es estatico.
+        # OJO: nunca dlopen()ear este .so (initial-exec + bloque grande
+        # excede el surplus de TLS estatico de glibc -> "cannot allocate
+        # memory in static TLS block").
+        '-ftls-model=initial-exec',
         '-DNEO_SYSROOT="@0@"'.format(sysroot),
         '-DNEO_BINDIR="@0@"'.format(ndir),
     ],
@@ -92,3 +99,14 @@ test('e2e', find_program('bash'),
            meson.project_source_root(),
            nrld_lim2.full_path()],
     timeout: 180)
+
+# Test TSan del scan strict del proxy: 8 hilos x 500 dlopen() concurrentes.
+# El estado del scan (found_bad/bad_path/verdict_cache) es TLS por hilo; este
+# test comprueba que la version con globals (codigo previo) reporta la
+# carrera y que la version TLS no reporta ninguna, y que el veredicto en
+# single-thread no cambia. Requiere el toolchain glibc del sysroot (libtsan):
+# sin el -> SKIP.
+test('tsan', find_program('bash'),
+    args: [files('test/tsan/run_tsan.sh'),
+           meson.project_source_root()],
+    timeout: 300)

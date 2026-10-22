@@ -28,13 +28,16 @@ entorno musl del host (sin mezclar dos libcs en un mismo proceso).
 | `sysroot_manager.c` / `.h` | 565 | Política de aislamiento musl↔glibc: resolución de sonames (dir del binario + subdirs estándar + dirs extra + sysroot, con fallback **extralibfinder**), guard **transitivo** de `DT_NEEDED` (incluido el **límite interno de dirs extra**), copias parcheadas de NEEDED absolutos (`shadow`), lectura de `/etc/nrld.conf` y registro de directorios extra de librerías. |
 | `appimages.c` / `.h` | 450 | Soporte AppImage type-2 (extracción squashfs a `/tmp`, binario interno) + los walkers recursivos de directorios: libs internas, plugin Qt (`QT_PLUGIN_PATH`) y el barrido de extracciones viejas. |
 | `nrld_paths.h` | 26 | Constantes de compilación compartidas: `NEO_SYSROOT`/`NEO_BINDIR` (overridables con `-D`), loader real, ruta del interp, dirs del sysroot, `GCONV_DIR`, proxy. |
-| `proxy_readlink.c` | 937 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + cache de veredictos + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
-| `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared), la variante de test `nrld-lim2` (`-DMAX_EXTRA_DIRS=2`, `install:false`), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y el test E2E. |
+| `proxy_readlink.c` | 978 | `LD_PRELOAD` que endereza `readlink("/proc/self/exe")` y aplica la aislación ABI en runtime (`dlopen` strict + estado del scan **por hilo** + crash diagnostics), **transparente bajo musl** (guard ABI: `dlopen("libc.so.6")==NULL` → pasa todo sin tocar nada). |
+| `meson.build` / `meson_options.txt` | — | Build del proyecto (ver **Compilar**): `nrld` (executable freestanding static), `libnrld-proxy.so` (shared, `-ftls-model=initial-exec`), la variante de test `nrld-lim2` (`-DMAX_EXTRA_DIRS=2`, `install:false`), genera e instala `/etc/nrld.conf` + `/etc/profile.d/nrld-profile.sh` (plantillas con `@PLACEHOLDERS@`), symlink `/lib64/ld-linux-x86-64.so.2`, y los tests E2E + TSan. |
 | `nrld.conf` | 16 | Plantilla de `/etc/nrld.conf` (host): `key = value` — `library_path` (LD_LIBRARY_PATH), `proxy` (LD_PRELOAD) y la clave `strict` (modo estricto global). |
 | `nrld-profile.sh` | 29 | Plantilla de `/etc/profile.d/nrld-profile.sh`: exporta `LD_PRELOAD` **condicionalmente** si el proxy existe en el filesystem (evita errores en chroot) y `NEONATOX_SYSROOT`; **no** exporta `LD_LIBRARY_PATH` (se inyecta por nrld). Sirve para que las pestañas de Firefox/Brave hereden el proxy (ver **Uso**). |
 | `scripts/post-install.sh` | 20 | Refresca el cache `ldconfig` del sysroot glibc (`-n` con los dirs del sysroot); no fatal, salta con `DESTDIR`. |
 | `test/gen_probes.py` | 578 | Genera ELF64 x86-64 mínimos de prueba (struct-only, sin toolchain glibc): `need_vdpau` (NEEDED `libvdpau_trace.so.1`), `need_missing` (NEEDED inexistente) y `need_multi` (varios DT_NEEDED: `libc.so.6` + 3 libs que solo viven en subdirs no estándar del sysroot — `vdpau/`, `gvfs/`, `cairo/` — para forzar 3 dirs extra distintos). |
 | `test/run_tests.sh` | 140 | E2E (corre vía `meson test`): humo rc=0, sweep ≤1 copia oculta, strict vs default, proxy transparente bajo musl, **canal stdout limpio** (regresión de Investigación 05: nrld no escribe nada por defecto y el diagnóstico con `NRLD_DEBUG=3` va a stderr) y **límite interno de dirs extra** (con `nrld-lim2`: aviso duro + lib reportada como faltante; con el límite real: rc=0). |
+| `test/tsan/tsan_dlopen.c` | 59 | Harness del test TSan: N hilos × N `dlopen()` concurrentes de la misma lib (8 × 500 `libm.so.6` por defecto), para sacar a luz la carrera del estado del scan strict. |
+| `test/tsan/run_tsan.sh` | 145 | Test TSan (corre vía `meson test`): construye el harness y el proxy dos veces (globals vs TLS) con el toolchain glibc del sysroot, exige que la build con globals **sí** reporte la carrera y la build con TLS **no**, y que el veredicto single-thread no cambie. `SKIP` (77) si el sysroot no trae toolchain glibc/`libtsan`. |
+| `test/tsan/tsan.supp` | 8 | Supresiones de TSan: silencia el ruido de glibc (el loader actualiza su link map desde varios hilos durante `dlopen`/`dlclose`). |
 | `README.md` | — | Este documento. |
 | `AGENTS.md` | — | Notas técnicas de la aislación musl↔glibc (restricciones, comportamientos conocidos). |
 
@@ -191,7 +194,8 @@ Copyright (C) 2026 Carlos Sanchez. Licencia GPL v3.
 | `redirect_to_sysroot` | Reencamina `dlopen("/usr/lib/...")` a la copia glibc del sysroot si existe (mismo path relativo). |
 | `dlopen`/`dlmopen` interposición | Solo strict: tras cada `dlopen` escanea **todo el link-map** (`dl_iterate_phdr`); si algo resuelve fuera del sysroot (musl) → `dlclose` + `NULL` + mensaje `[neonatox] Falta la libreria...`. Cubre árboles cargados en runtime (el `libxul` de Firefox). |
 | **Scrub de env en exec (hijos musl)** | Interpone `execve`/`execv`/`execvp`/`execvpe`/`fexecve`/`posix_spawn`/`posix_spawnp`: si el **destino es musl** (ELF con interp `ld-musl-*` o shebang `#!` cuyo intérprete sea musl), retira `LD_LIBRARY_PATH` y `LD_PRELOAD` del `envp` antes de delegar (el destino real — resuelto por PATH si es nombre sin `/` — se inspecciona con `open`+`pread` sin crear FDs residuales). Fix del crash GTK/OpenCode (app glibc → `bwrap`/glycin musl heredaba `LD_LIBRARY_PATH` glibc → `Error relocating libcap.so.2: __isoc23_strtoul` → exit 127). **Seguro en ambos sentidos**: los hijos glibc conservan el env (re-entran a nrld por interp, que re-inyecta `LD_*`) y los musl no se contaminan. *Gap documentado:* `execl*` y `execveat` no están interpuestos (la app debe exportar un `envp`; `execl*` construye el envp interno — resolvería igual vía libc, pero no se filtra). Ver sección *Scrub de LD\_\* en exec*. |
-| Verdict cache | Una ruta permitida queda permitida para todo el proceso → Chromium (cientos de `dlopen`) no paga un walk completo por cada uno. |
+| Verdict cache | Cache **por hilo** (TLS) de los veredictos "permitido": una ruta verificada no se vuelve a comparar en los próximos scans **de ese hilo**. Bounded (512 entradas × 320 B = 160 KB de TLS por hilo) y FIFO. NO evita el walk del link map (`dl_iterate_phdr` se llama en **cada** scan): solo ahorra las comparaciones de `is_allowed_path` por objeto ya verificado. Con `-DNRLD_VERDICT_CACHE_MAX=0` el cache desaparece (TLS de 4 KB/hilo, mismo veredicto). |
+| Estado del scan strict en TLS | `found_bad`/`bad_path`/`verdict_cache` son **por hilo** (`__thread`, ver `struct scan_state`). Como globales, dos hilos con `dlopen` concurrente (Chromium) se pisaban: data race y, peor, el `found_bad = 0` de un hilo **borraba el veredicto de otro** (un rechazo estricto se perdía en silencio → la app cargaba la lib musl → mezcla de ABI → SIGSEGV). El proxy se compila con `-ftls-model=initial-exec` (acceso directo, sin `__tls_get_addr`). `-DNRLD_SCAN_TLS=0` recompila el estado como globales: solo lo usa el test TSan, que reproduce así la carrera del código previo. |
 | Crash diagnostics (`NEONATOX_CRASHDUMP=1`) | Handlers SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE: dump del módulo+offset (vía `/proc/self/maps`) y de librerías musl mapeadas. |
 | `NEONATOX_PROXY_LOG` / `NEONATOX_DUMPENV` | Espejo a archivo de los mensajes `[neonatox]` (no a stderr, para no ensuciar) y dump del entorno a `/tmp/neonatox-env-<pid>.txt`. |
 
@@ -213,7 +217,7 @@ O receta **manual** (mismos binarios, sin conf/perfil/symlink automático):
 
 ```bash
 # 1. Proxy (sin libc: deja símbolos undefined, los resuelve glibc en runtime)
-gcc -nostdlib -shared -fPIC -o libnrld-proxy.so \
+gcc -nostdlib -shared -fPIC -ftls-model=initial-exec -o libnrld-proxy.so \
     -I/usr/lib/glibc6/usr/include \
     proxy_readlink.c
 
@@ -237,6 +241,12 @@ gcc -nostdlib -static -ffreestanding -fno-stack-protector -O2 -s \
 > El proxy debe compilarse **sin** libc del host y con `-fno-stack-protector`
 > ausentes → símbolos ambiguos quedan como undefined legítimos que glibc resuelve
 > en runtime (en meson, `b_lundef=false`).
+> `-ftls-model=initial-exec` en el proxy: el estado del scan strict es TLS por
+> hilo y el proxy es **siempre `LD_PRELOAD`** (nunca `dlopen`): con
+> initial-exec el acceso es directo (sin `__tls_get_addr`) y el bloque TLS
+> (160 KB) queda en el área TLS estática. *Restricción:* un `dlopen` de este
+> `.so` fallaría con "cannot allocate memory in static TLS block" (el
+> surplus estático de glibc son 512 B).
 
 ## Instalar (requiere root)
 
@@ -356,6 +366,47 @@ los binarios musl del host (ver `test/run_tests.sh`, caso 4).
 
 ---
 
+## Test TSan del scan strict (data race del estado del scan)
+
+El scan strict del proxy (el que recorre el link map tras cada `dlopen`) mantiene su
+estado —`found_bad`, `bad_path`, `verdict_cache`— que **se mutaba desde `dlopen`
+concurrente** (Chromium abre libs en paralelo). Con estado global eso es un data race y,
+peor, un bug funcional: el `found_bad = 0` de un hilo **borraba el veredicto de otro**
+(un rechazo estricto se perdía en silencio y la app acababa cargando la build musl →
+mezcla de ABI → SIGSEGV). El estado es ahora **por hilo** (`__thread`).
+
+`test/tsan/` comprueba las tres cosas:
+
+| Caso | Qué exige |
+|---|---|
+| 1. estado en **globales** (`-DNRLD_SCAN_TLS=0`, el código previo) | TSan **tiene que** reportar la carrera (si no, el detector no serviría y el test sería vacío) |
+| 2. estado en **TLS** (el fix) | **ninguna** carrera; el harness completa las 8×500 `dlopen` |
+| 3. veredicto **single-thread** | sin cambios: una lib dentro del sysroot se permite, una fuera se rechaza con el mismo mensaje |
+
+```bash
+meson test -C build                      # e2e + tsan
+bash test/tsan/run_tsan.sh "$PWD"         # solo el tsan
+```
+
+Detalles del entorno que el test resuelve (y que son fáciles de no ver):
+
+- El host es musl y su `gcc` **no** puede construir binarios glibc con TSan, pero el
+  sysroot trae un toolchain glibc completo: `/usr/lib/glibc6/usr/bin/gcc` (15.2.0) +
+  `libtsan.so`. Sin ellos el test hace **SKIP** (77). Esto desbloquea la "limitación
+  conocida" que tenía el README: por fin hay binarios de test glibc de verdad.
+- El sysroot no trae los symlinks de enlazado (`libc.so`, `libgcc_s.so`…): el script
+  los crea en un dir privado. El binario se ejecuta con el loader **real** del sysroot
+  (`ld-linux-x86-64.so.2 --library-path …`), no con `/lib64` (que en este host apunta a
+  nrld).
+- **`symbolize=0` es obligatorio**: el symbolizer de TSan hace `fork`/`exec` y se
+  cuelga (deadlock) con el lock del loader cuando hay `dlopen` concurrente. Los offsets
+  del reporte se simbolizan **offline** con `addr2line` (el test imprime
+  `verdict_cached`/`verdict_add`/`dlopen_pulled_musl` de la carrera detectada).
+- `test/tsan/tsan.supp` silencia el ruido de glibc (`_dl_find_object_update`: el loader
+  actualiza su link map desde varios hilos; no es código nuestro).
+
+---
+
 ## Estado actual
 
 - **Sysroot** `/usr/lib/glibc6/`: core glibc + libstdc++/libgcc_s + **pila GUI base** glibc
@@ -408,9 +459,23 @@ los binarios musl del host (ver `test/run_tests.sh`, caso 4).
   manteniendo la receta gcc manual. **E2E en `meson test`** sobre ELF64 mínimos generados por
   `test/gen_probes.py` (estructura a mano, sin toolchain glibc en el host): humo rc=0,
   sweep ≤1 copia, strict vs default y proxy-musl-transparente — todo verde.
+- **Data race del scan strict (fix)**: el estado del scan (`found_bad`, `bad_path`,
+  `verdict_cache`) era **global** y se mutaba desde `dlopen` concurrente (Chromium):
+  data race y bug funcional (el `found_bad = 0` de un hilo borraba el veredicto de otro →
+  un rechazo estricto se perdía en silencio → la app cargaba la lib musl → mezcla de ABI).
+  Ahora es **por hilo** (`__thread`, `struct scan_state`) y el proxy se compila con
+  `-ftls-model=initial-exec` (el proxy es siempre `LD_PRELOAD`, así que su bloque TLS
+  —160 KB— queda en el área estática). `VERDICT_CACHE_MAX` 2048 → 512 (footprint del
+  TLS por hilo); con `-DNRLD_VERDICT_CACHE_MAX=0` el cache desaparece (4 KB/hilo, mismo
+  veredicto). **E2E**: `test/tsan/run_tsan.sh` (test `tsan` de `meson test`): 8 hilos ×
+  500 `dlopen("libm.so.6")` → la build con globals reporta la carrera, la build con TLS
+  no reporta ninguna, y el veredicto single-thread es idéntico.
 - **Limitación conocida**: el toolchain musl del host no puede construir binarios dinámicos
   glibc de test (`libc.a` sin `_init`/`_fini`); los flujos end-to-end de dlopen se validan con
   los artefactos prácticos reales (los probes de `gen_probes.py` se escriben a mano).
+  *Salvedad:* el **sysroot sí trae un toolchain glibc** (`/usr/lib/glibc6/usr/bin/gcc`
+  15.2.0 + `libtsan.so`), con el que el test TSan construye de verdad binarios glibc
+  (el E2E histórico sigue con los probes a mano).
 
 ---
 

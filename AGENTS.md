@@ -23,8 +23,10 @@ Manual recipe (same as meson outputs; defaults `NEO_SYSROOT=/usr/lib/glibc6`,
 # 1. Proxy shared library (no libc: leaves symbols undefined, resolved by glibc
 #    at runtime. Linking with musl `gcc -ldl` would emit NEEDED [libc.so] (musl
 #    soname) -> "invalid ELF header" in the glibc loader. Must use -nostdlib.
-#    Meson passes -DNEO_SYSROOT/-DNEO_BINDIR + b_lundef=false.)
-gcc -nostdlib -shared -fPIC -o libnrld-proxy.so \
+#    Meson passes -DNEO_SYSROOT/-DNEO_BINDIR + b_lundef=false.
+#    -ftls-model=initial-exec: the strict-scan state is per-thread TLS and the
+#    proxy is ALWAYS LD_PRELOAD'd (never dlopen), so initial-exec applies.
+gcc -nostdlib -shared -fPIC -ftls-model=initial-exec -o libnrld-proxy.so \
     -I/usr/lib/glibc6/usr/include \
     proxy_readlink.c
 
@@ -135,6 +137,19 @@ Firefox's GTK/ICU/Pango come via **runtime `dlopen`** of `libxul.so`, not static
 - Verified in this env: proxy loads cleanly under glibc with strict both off and on; sysroot-resolved loads (locale, NSS via `getent passwd`, gconv via `iconv`) are allowed and not false-rejected. Algorithm validated with a musl probe: `dl_iterate_phdr` after `dlopen(musl-lib)` correctly reveals the pulled musl deps.
 - **Build caveat:** the musl host toolchain CANNOT build working glibc dynamic test binaries (`libc.a` missing `_init`/`_fini`; `dlopen` test binaries SIGSEGV at `_start`), so no live end-to-end rejection of the real `libxul→musl-GTK` chain is possible here — only the sysroot-allowed path is verified live.
 - **Live result with Firefox (strict on):** holds no longer as "clean" — with the sysroot missing the whole GUI/ICU stack and the guard not yet catching `libxul`'s dlopen'd subtree, Firefox still mixed musl/glibc and SIGSEGV'd (coredump shows both libcs + musl GTK/ICU in one process). The proxy link-map scan above is the intended fix; needs root install + live re-test.
+
+### Strict-scan state is per-thread (data race fix, `proxy_readlink.c`)
+
+The link-map scan keeps state across the scan: `found_bad` (verdict flag), `bad_path` (offending library path) and the `verdict_cache` (memoized "allowed" paths). That state was **global** and is mutated from **concurrent `dlopen`** (Chromium opens libraries in parallel from several threads), so:
+- **Data race** (reported by TSan).
+- **Real bug, not just theoretical:** the `found_bad = 0` that starts every scan belongs to one thread and can wipe the verdict another thread just produced → a strict rejection is **lost silently** → the app keeps the musl build loaded (ABI mix → SIGSEGV). `bad_path` could also be copied half-way (corrupted error message).
+
+**Fix:** the state lives in `struct scan_state` and is `__thread` (`static SCAN_TLS struct scan_state g_scan`). Per-thread verdict is identical (the link map only grows and the allowlist never changes) — verified live. `-DNRLD_SCAN_TLS=0` recompiles the state as plain globals: **only the TSan test uses it**, to reproduce the pre-fix race.
+- **Footprint:** the TLS block is `VERDICT_CACHE_MAX` (2048 → **512**) × `VERDICT_PATH_MAX` (320) + 4 KB = **164 KB per thread** of static TLS (`PT_TLS` 0x2900c). The cache does **not** avoid the link-map walk (`dl_iterate_phdr` runs on every scan); it only skips the `is_allowed_path` comparisons of already-verified objects. `-DNRLD_VERDICT_CACHE_MAX=0` drops the cache → 4 KB/thread, same verdict.
+- **Build:** the proxy is compiled with `-ftls-model=initial-exec` (direct TLS access, no `__tls_get_addr`). The proxy must stay **LD_PRELOAD-only**: `dlopen`ing a `.so` with initial-exec and a 164 KB TLS block exceeds glibc's static TLS surplus (512 B) → "cannot allocate memory in static TLS block".
+- **E2E (`test/tsan/`, meson test `tsan`):** 8 threads × 500 `dlopen("libm.so.6")` with `NEONATOX_STRICT_SYSROOT=1`. The script builds the proxy twice from the same source (globals vs TLS) with the **sysroot's glibc toolchain** (`/usr/lib/glibc6/usr/bin/gcc` 15.2.0 + `libtsan.so` — the musl host toolchain cannot build glibc+TSan binaries) and asserts: globals build → race reported; TLS build → no race and the harness completes; single-thread verdict unchanged (allowed inside the sysroot, rejected outside, same message).
+  - **`symbolize=0` is mandatory there**: TSan's symbolizer `fork`s and deadlocks against the loader lock under concurrent `dlopen` (verified: run hangs). The script symbolizes the reported offsets offline with `addr2line`.
+  - `test/tsan/tsan.supp` suppresses glibc's own noise (`_dl_find_object_update`, loader link-map updates from several threads).
 
 ### Transitive NEEDED guard (nrld)
 

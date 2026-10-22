@@ -488,40 +488,80 @@ static void install_crashdump(void) {
     sigaction(SIGABRT, &sa, NULL);
 }
 
-static char bad_path[4096];
-static int found_bad;
+/* Estado del scan strict: POR HILO (TLS).
+ *
+ * found_bad/bad_path/verdict_cache se mutaban desde dlopen()
+ * concurrente (Chromium abre libs en paralelo): como globales, dos
+ * hilos se pisan el estado -> data race y, peor, el `found_bad = 0`
+ * de un hilo borra el veredicto de otro (un rechazo estricto se
+ * pierde en silencio y la app carga la lib musl: mezcla de ABI ->
+ * SIGSEGV). Con TLS cada hilo tiene su propio estado: el veredicto
+ * por hilo es el mismo (el link map solo crece y la allowlist no
+ * cambia) y no hay carrera.
+ *
+ * NRLD_SCAN_TLS=0 recompila el estado como globales: solo lo usa el
+ * test TSan (test/tsan/run_tsan.sh), que debe poder reproducir la
+ * carrera del codigo previo para comprobar que el detector la ve. */
+#ifndef NRLD_SCAN_TLS
+#define NRLD_SCAN_TLS 1
+#endif
+#if NRLD_SCAN_TLS
+#  define SCAN_TLS __thread
+#else
+#  define SCAN_TLS
+#endif
 
-/* Verdict cache for the strict link-map scan. A path allowed once stays
-   allowed for the whole process (the link map only grows), so Chromium-style
-   apps that dlopen the same libs many times don't pay a full map walk per
-   call. Bounded static array, FIFO eviction. */
-#define VERDICT_CACHE_MAX 2048
+/* Cache de veredictos "permitido" del scan strict: bounded, FIFO. NO
+   evita el walk del link map (dl_iterate_phdr se llama en cada scan):
+   solo ahorra las comparaciones de is_allowed_path por objeto ya
+   verificado. Footprint: NRLD_VERDICT_CACHE_MAX * VERDICT_PATH_MAX
+   bytes de TLS por hilo (512*320 = 160 KB). Con 0 -> sin cache y el TLS
+   queda en 4 KB/hilo (el veredicto es el mismo). */
+#ifndef NRLD_VERDICT_CACHE_MAX
+#define NRLD_VERDICT_CACHE_MAX 512
+#endif
 #define VERDICT_PATH_MAX  320
-static char verdict_cache[VERDICT_CACHE_MAX][VERDICT_PATH_MAX];
-static unsigned verdict_cache_n = 0;
-static unsigned verdict_cache_next = 0;
+
+struct scan_state {
+    char     bad_path[4096];
+    int      found_bad;
+#if NRLD_VERDICT_CACHE_MAX > 0
+    char     verdict_cache[NRLD_VERDICT_CACHE_MAX][VERDICT_PATH_MAX];
+    unsigned verdict_cache_n;
+    unsigned verdict_cache_next;
+#endif
+};
+static SCAN_TLS struct scan_state g_scan;
 
 static int verdict_cached(const char *nm) {
+#if NRLD_VERDICT_CACHE_MAX > 0
     unsigned int n = 0;
     while (nm[n]) n++;
     if (n >= VERDICT_PATH_MAX) return 0;
-    for (unsigned i = 0; i < verdict_cache_n; i++)
-        if (memcmp(verdict_cache[i], nm, n + 1) == 0) return 1;
+    for (unsigned i = 0; i < g_scan.verdict_cache_n; i++)
+        if (memcmp(g_scan.verdict_cache[i], nm, n + 1) == 0) return 1;
+#else
+    (void)nm;                        /* cache desactivado */
+#endif
     return 0;
 }
 
 static void verdict_add(const char *nm) {
+#if NRLD_VERDICT_CACHE_MAX > 0
     unsigned int n = 0;
     while (nm[n]) n++;
     if (n >= VERDICT_PATH_MAX) return;
     unsigned slot;
-    if (verdict_cache_n < VERDICT_CACHE_MAX) {
-        slot = verdict_cache_n++;
+    if (g_scan.verdict_cache_n < NRLD_VERDICT_CACHE_MAX) {
+        slot = g_scan.verdict_cache_n++;
     } else {
-        slot = verdict_cache_next;
-        verdict_cache_next = (verdict_cache_next + 1) % VERDICT_CACHE_MAX;
+        slot = g_scan.verdict_cache_next;
+        g_scan.verdict_cache_next = (g_scan.verdict_cache_next + 1) % NRLD_VERDICT_CACHE_MAX;
     }
-    memcpy(verdict_cache[slot], nm, n + 1);
+    memcpy(g_scan.verdict_cache[slot], nm, n + 1);
+#else
+    (void)nm;                        /* cache desactivado */
+#endif
 }
 
 /* Visit every loaded shared object (main program + all NEEDED of every
@@ -553,13 +593,13 @@ static int scan_link_map_cb(struct dl_phdr_info *info, size_t size, void *data) 
     /* Never flag the proxy itself, whatever path it was preloaded from
        (installed sysroot copy or a local build under test). */
     if (ends_with(nm, "/libnrld-proxy.so")) { verdict_add(nm); return 0; }
-    if (!found_bad) {
+    if (!g_scan.found_bad) {
         size_t n = strlen(nm);
-        if (n >= sizeof(bad_path)) n = sizeof(bad_path) - 1;
-        memcpy(bad_path, nm, n);
-        bad_path[n] = '\0';
+        if (n >= sizeof(g_scan.bad_path)) n = sizeof(g_scan.bad_path) - 1;
+        memcpy(g_scan.bad_path, nm, n);
+        g_scan.bad_path[n] = '\0';
     }
-    found_bad = 1;
+    g_scan.found_bad = 1;
     return 1;                                /* stop scanning */
 }
 
@@ -567,15 +607,16 @@ static int scan_link_map_cb(struct dl_phdr_info *info, size_t size, void *data) 
    closure is already mapped. Return 1 if any of them is a musl /usr/lib
    build (ABI mix), 0 otherwise. */
 static int dlopen_pulled_musl(void) {
-    found_bad = 0;
+    g_scan.found_bad = 0;
     dl_iterate_phdr(scan_link_map_cb, NULL);
-    return found_bad;
+    return g_scan.found_bad;
 }
 
 static void *verify_dlopen_handle(void *h, const char *filename) {
     if (!h || !strict_sysroot) return h;
     if (!dlopen_pulled_musl()) return h;
-    reject_handle(h, bad_path[0] ? bad_path : (filename ? filename : "(sin nombre)"));
+    reject_handle(h, g_scan.bad_path[0] ? g_scan.bad_path
+                                        : (filename ? filename : "(sin nombre)"));
     return NULL;
 }
 

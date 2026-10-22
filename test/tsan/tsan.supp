@@ -1,0 +1,8 @@
+# Supresiones de TSan para el test del scan strict del proxy.
+#
+# Ruido de glibc (el loader no va instrumentado): durante dlopen/dlclose
+#.concurrentes el loader actualiza su propio link map desde varios hilos
+# (_dl_map_object_deps / _dl_find_object_update). No es codigo nuestro.
+race:_dl_find_object_update
+race:_dlfo_mappings_segment_allocate
+race:dl-find_object.c
