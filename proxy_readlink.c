@@ -747,13 +747,19 @@ static int fd_interp_musl(int fd) {
             return 0;
         if (el32(ph) != 3) continue;                 /* PT_INTERP */
         unsigned long long poff = is64 ? el64(ph + 0x08) : el32(ph + 0x04);
-        unsigned long long pfsz = is64 ? el64(ph + 0x20) : el32(ph + 0x14);
+        /* p_filesz del PT_INTERP: Elf64_Phdr -> 0x20 (tras type/flags/offset/
+           vaddr/paddr), Elf32_Phdr -> 0x10 (tras type/offset/vaddr/paddr).
+           OJO: en 32-bit 0x14 es p_memsz, NO p_filesz (leerlo daba la
+           longitud equivocada -> pread corto -> sin scrub del envp). */
+        unsigned long long pfsz = is64 ? el64(ph + 0x20) : el32(ph + 0x10);
         if (pfsz == 0 || pfsz > 256) return 0;
         char interp[257];
         if (pread(fd, interp, (size_t)pfsz, (off_t)poff) != (ssize_t)pfsz) return 0;
         interp[pfsz] = '\0';
+        /* Longitud real de la string (puede haber relleno tras la NUL). */
+        size_t ilen = strnlen(interp, (size_t)pfsz);
         /* musl: /lib/ld-musl-x86_64.so.1 (cualquier arch: "ld-musl-*"). */
-        return mem_find(interp, (size_t)pfsz, "ld-musl", 7);
+        return mem_find(interp, ilen, "ld-musl", 7);
     }
     return 0;
 }
