@@ -30,6 +30,22 @@
 #include "appimages.h"
 #include "executor.h"
 
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_poll
+#define __NR_poll 7
+#endif
+#ifndef POLLIN
+#define POLLIN 0x001
+#endif
+
+struct pollfd {
+    int fd;
+    short events;
+    short revents;
+};
+
 typedef struct { long a_type; long a_val; } Elf64_auxv_t;
 #define AT_NULL    0
 #define AT_EXECFN  31
@@ -108,34 +124,122 @@ static void cleanup_run_residue(const char *interp_copy) {
 }
 
 /* Espera a que el proceso padre (el pid que tras el execve es la app) ya no
-   exista. Se usa kill(pid,0) (senal de prueba) por si el padre sigue como
-   zombie antes de que el shell lo reapare; en ese caso se comprueba su
-   estado en /proc/<pid>/stat. */
+   exista. Camino principal: pidfd_open + poll (sin nanosleep) ligado a esa
+   instancia concreta del PID. Fallback (kernel < 5.3): comparar starttime
+   extraido desde el ULTIMO ')' de /proc/<pid>/stat para detectar reciclaje
+   de PID. */
+static int find_last_paren_close(const char *buf, long n) {
+    if (n <= 0) return -1;
+    for (long i = n - 1; i >= 0; i--) {
+        if (buf[i] == ')') return (int)i;
+    }
+    return -1;
+}
+
+static int extract_starttime_after_last_paren(const char *buf, long n, char *out, int outsz) {
+    if (!buf || !out || outsz < 2 || n <= 0) return 0;
+    int lp = find_last_paren_close(buf, n);
+    if (lp < 0 || lp + 2 >= n) return 0;
+    /* Campos tras ") ": state, ppid, pgrp, session, tty_nr, tpgid, flags,
+       minflt, cminflt, majflt, cmajflt, utime, stime, cutime, cstime,
+       priority, nice, num_threads, itrealvalue, starttime, ... */
+    const char *p = buf + lp + 2;
+    int tok = 0;
+    while (*p && (p < buf + n)) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (!*p || p >= buf + n) break;
+        if (*p == ')') break;
+        const char *start = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != ')') p++;
+        if (tok == 19) {
+            long len = p - start;
+            if (len >= outsz) len = outsz - 1;
+            for (long i = 0; i < len; i++) out[i] = start[i];
+            out[len] = '\0';
+            return 1;
+        }
+        tok++;
+    }
+    return 0;
+}
+
 static void wait_parent_dead(void) {
     long parent = syscall0(SYS_getppid);
+
+    /* Camino principal: pidfd_open + poll, ligado a la instancia del PID. */
+    {
+        int pfd = (int)syscall2(__NR_pidfd_open, parent, 0);
+        if (pfd >= 0) {
+            struct pollfd pf;
+            pf.fd = pfd;
+            pf.events = POLLIN;
+            pf.revents = 0;
+            /* Bloquea hasta que el proceso termine/reap; sin nanosleep. */
+            syscall3(__NR_poll, (long)&pf, 1, -1);
+            syscall1(SYS_close, pfd);
+            return;
+        }
+    }
+
+    /* Fallback: comparar starttime (kernel < 5.3). */
+    char orig_start[32];
+    orig_start[0] = '\0';
+    {
+        char sp0[48];
+        my_strcpy(sp0, "/proc/");
+        char pb0[24];
+        uint_to_str(parent, pb0, sizeof(pb0));
+        my_strcat(sp0, pb0);
+        my_strcat(sp0, "/stat");
+        long fd0 = syscall2(SYS_open, (long)sp0, 0);
+        if (fd0 >= 0) {
+            char buf0[512];
+            long n0 = syscall3(SYS_read, fd0, (long)buf0, sizeof(buf0) - 1);
+            syscall1(SYS_close, fd0);
+            if (n0 > 0) {
+                buf0[n0] = '\0';
+                extract_starttime_after_last_paren(buf0, n0, orig_start, sizeof(orig_start));
+            }
+        }
+    }
+
     for (;;) {
         if (syscall2(SYS_kill, parent, 0) < 0) return;
-        char sp[40];
+        char sp[48];
         my_strcpy(sp, "/proc/");
         char pb[24];
         uint_to_str(parent, pb, sizeof(pb));
         my_strcat(sp, pb);
         my_strcat(sp, "/stat");
         long fd = syscall2(SYS_open, (long)sp, 0);
-        if (fd >= 0) {
-            char buf[128];
-            long n = syscall3(SYS_read, fd, (long)buf, sizeof(buf) - 1);
-            syscall1(SYS_close, fd);
-            if (n > 0) {
-                buf[n] = '\0';
-                for (long i = 0; i + 2 < n; i++) {
-                    if (buf[i] == ')' && buf[i + 1] == ' ' && buf[i + 2] == 'Z') {
-                        return;
-                    }
+        if (fd < 0) return;
+        char buf[512];
+        long n = syscall3(SYS_read, fd, (long)buf, sizeof(buf) - 1);
+        syscall1(SYS_close, fd);
+        if (n <= 0) {
+            long ts[2] = { 0, 30000000 };   /* 30 ms */
+            syscall2(SYS_nanosleep, (long)ts, 0);
+            continue;
+        }
+        buf[n] = '\0';
+        if (orig_start[0]) {
+            char cur_start[32];
+            cur_start[0] = '\0';
+            if (extract_starttime_after_last_paren(buf, n, cur_start, sizeof(cur_start))) {
+                if (my_strcmp(cur_start, orig_start) != 0) {
+                    /* PID reciclado -> pertenece a otro proceso */
+                    return;
                 }
+            } else {
+                /* No se pudo extraer starttime; ser conservador y tratar como muerto */
+                return;
             }
-        } else {
-            return;
+        }
+        /* Comprobar si el proceso original esta zombie */
+        for (long i = 0; i + 2 < n; i++) {
+            if (buf[i] == ')' && buf[i + 1] == ' ' && buf[i + 2] == 'Z') {
+                return;
+            }
         }
         long ts[2] = { 0, 30000000 };   /* 30 ms */
         syscall2(SYS_nanosleep, (long)ts, 0);
